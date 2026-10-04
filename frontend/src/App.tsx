@@ -7,6 +7,7 @@ import { ROUTES } from './router'
 import { useDamStore } from './stores/damStore'
 import { usePointStore } from './stores/pointStore'
 import { useAlarmStore } from './stores/alarmStore'
+import { useBaselineStore } from './stores/baselineStore'
 import { useIdbTable } from './hooks/useIdbTable'
 import { db, type ObservationRow } from './utils/db'
 
@@ -18,17 +19,20 @@ export default function App() {
   const damStore = useDamStore()
   const pointStore = usePointStore()
   const alarmStore = useAlarmStore()
+  const baselineStore = useBaselineStore()
   const observationTable = useIdbTable<ObservationRow>(db.observations, { sortByUpdatedAt: false })
 
   const currentDam = damStore.currentDam()
   const openAlarms = alarmStore.alarms.filter((alarm) => alarm.state !== '已闭环').length
+  const pendingReviews = baselineStore.pendingReviewCount()
+  const alarmBadge = openAlarms + pendingReviews
 
   const navItems = [
     { path: ROUTES.dams, label: '坝体台账', count: damStore.dams.length },
     { path: ROUTES.points, label: '测点配置', count: pointStore.points.length },
     { path: ROUTES.observations, label: '观测录入', count: observationTable.rows.length },
     { path: ROUTES.trends, label: '速率计算', count: pointStore.points.length },
-    { path: ROUTES.alarms, label: '预警处置', count: openAlarms },
+    { path: ROUTES.alarms, label: '预警处置', count: alarmBadge },
     { path: ROUTES.pool, label: '库水位', count: 0 }
   ]
 
@@ -74,8 +78,8 @@ export default function App() {
             )}
           </Space>
           <Space size={8} wrap>
-            <Tooltip title="未闭环预警数量">
-              <Badge count={openAlarms} showZero color="#b03a2e" />
+            <Tooltip title={`未闭环预警 ${openAlarms} 张，基准级别待复核 ${pendingReviews} 项`}>
+              <Badge count={alarmBadge} showZero color="#b03a2e" />
             </Tooltip>
             <Button size="small" onClick={() => navigate(ROUTES.dams)}>
               坝体台账

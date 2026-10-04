@@ -13,8 +13,11 @@ import StatBadge from '@/components/common/StatBadge'
 import { useDamStore } from '@/stores/damStore'
 import { usePointStore } from '@/stores/pointStore'
 import { useAlarmStore } from '@/stores/alarmStore'
+import { useBaselineStore } from '@/stores/baselineStore'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { db, type ObservationRow } from '@/utils/db'
+import { exportAlarmCsv, exportHandoverCsv } from '@/utils/export'
+import type { BaselineReview } from '@/types/baseline'
 import {
   ALARM_LEVELS,
   ALARM_STATE_FLOW,
@@ -31,6 +34,7 @@ export default function AlarmBoard() {
   const damStore = useDamStore()
   const pointStore = usePointStore()
   const alarmStore = useAlarmStore()
+  const baselineStore = useBaselineStore()
   const observationTable = useIdbTable<ObservationRow>(db.observations, { sortByUpdatedAt: false })
 
   const [form] = Form.useForm<AlarmDraft>()
@@ -39,6 +43,28 @@ export default function AlarmBoard() {
   const [closeOpen, setCloseOpen] = useState(false)
   const [closeTarget, setCloseTarget] = useState<Alarm | null>(null)
   const [closeForm] = Form.useForm<{ handler: string; measure: string }>()
+  const [reviewTarget, setReviewTarget] = useState<BaselineReview | null>(null)
+  const [reviewForm] = Form.useForm<{ reviewer: string; reviewRemark: string }>()
+
+  const pendingReviews = baselineStore.reviews.filter((item) => item.status === '待复核')
+
+  const submitReview = async (): Promise<void> => {
+    const values = await reviewForm.validateFields().catch(() => null)
+    if (!values || !reviewTarget) return
+    await baselineStore.resolveReview(reviewTarget.id, values.reviewer, values.reviewRemark)
+    message.success('基准级别变化复核已归档')
+    setReviewTarget(null)
+  }
+
+  const exportAlarms = (): void => {
+    exportAlarmCsv(damStore.dams, pointStore.points, alarmStore.alarms)
+    message.success('预警闭环台账已导出（处置记录保持当时结果）')
+  }
+
+  const exportHandovers = (): void => {
+    exportHandoverCsv(damStore.dams, pointStore.points, baselineStore.handovers, baselineStore.reviews)
+    message.success('基准移交履历已导出')
+  }
 
   const filterSelects = useMemo(
     () => [
@@ -156,6 +182,52 @@ export default function AlarmBoard() {
     return { label: `${point.code} · ${point.type} · ${dam ? dam.name : '未知坝体'}`, value: point.id }
   })
 
+  const reviewColumns: TableColumnsType<BaselineReview> = [
+    {
+      title: '坝体 / 测点',
+      width: 200,
+      render: (_value, record) => {
+        const point = pointStore.points.find((item) => item.id === record.pointId)
+        const dam = damStore.dams.find((item) => item.id === record.damId)
+        return `${dam ? dam.name : '—'} / ${point ? point.code : '测点已删除'}`
+      }
+    },
+    { title: '换管生效日', dataIndex: 'effectiveDate', width: 110 },
+    {
+      title: '级别变化',
+      width: 230,
+      render: (_value, record) => (
+        <Space size={6}>
+          {record.fromLevel ? <AlarmTag level={record.fromLevel} size="small" /> : <Tag color="green">正常</Tag>}
+          <span className="muted">→</span>
+          {record.toLevel ? <AlarmTag level={record.toLevel} size="small" /> : <Tag color="green">正常</Tag>}
+        </Space>
+      )
+    },
+    {
+      title: '旧 / 新基准累计',
+      width: 170,
+      render: (_value, record) =>
+        `${record.fromCumulative.toFixed(2)} / ${record.toCumulative === null ? '—' : record.toCumulative.toFixed(2)}`
+    },
+    {
+      title: '操作',
+      width: 100,
+      render: (_value, record) => (
+        <Button
+          type="link"
+          size="small"
+          onClick={() => {
+            setReviewTarget(record)
+            reviewForm.setFieldsValue({ reviewer: record.reviewer, reviewRemark: record.reviewRemark })
+          }}
+        >
+          填写复核
+        </Button>
+      )
+    }
+  ]
+
   const columns: TableColumnsType<Alarm> = [
     {
       title: '坝体 / 测点',
@@ -228,6 +300,8 @@ export default function AlarmBoard() {
           </p>
         </div>
         <div className="page-head__actions">
+          <Button onClick={exportHandovers}>导出基准移交 CSV</Button>
+          <Button onClick={exportAlarms}>导出预警闭环 CSV</Button>
           <Button
             onClick={() => {
               alarmStore.patchFilter({ onlyOpen: !alarmStore.onlyOpen })
@@ -249,6 +323,25 @@ export default function AlarmBoard() {
       </div>
 
       <FilterBar model={model} selects={filterSelects} keywordPlaceholder="搜索测点编号 / 处置人 / 措施" onModelChange={onModelChange} />
+
+      {pendingReviews.length > 0 ? (
+        <div className="panel" style={{ marginTop: 16, borderColor: '#e0b45c' }}>
+          <div className="panel-head">
+            <h3 className="panel-title" style={{ margin: 0 }}>
+              基准移交级别变化待复核（{pendingReviews.length}）
+            </h3>
+            <span className="muted">换管后新旧基准判定级别发生变化；已闭环预警维持原处置记录，不参与重算</span>
+          </div>
+          <Table<BaselineReview>
+            rowKey="id"
+            size="small"
+            bordered
+            pagination={false}
+            dataSource={pendingReviews}
+            columns={reviewColumns}
+          />
+        </div>
+      ) : null}
 
       <div className="panel" style={{ marginTop: 16 }}>
         <div className="panel-head">
@@ -323,6 +416,42 @@ export default function AlarmBoard() {
             <Input.TextArea rows={3} placeholder="填写处置经过与复测结论" />
           </Form.Item>
         </Form>
+      </Modal>
+
+      <Modal
+        open={reviewTarget !== null}
+        title="基准移交级别变化复核"
+        onCancel={() => setReviewTarget(null)}
+        onOk={submitReview}
+        okText="提交复核"
+        cancelText="取消"
+        destroyOnClose
+      >
+        {reviewTarget ? (
+          <>
+            <Space style={{ marginBottom: 12 }}>
+              {reviewTarget.fromLevel ? (
+                <AlarmTag level={reviewTarget.fromLevel} size="small" />
+              ) : (
+                <Tag color="green">正常</Tag>
+              )}
+              <span className="muted">→</span>
+              {reviewTarget.toLevel ? <AlarmTag level={reviewTarget.toLevel} size="small" /> : <Tag color="green">正常</Tag>}
+              <span className="muted">
+                旧基准累计 {reviewTarget.fromCumulative.toFixed(2)} / 新基准累计{' '}
+                {reviewTarget.toCumulative === null ? '—' : reviewTarget.toCumulative.toFixed(2)}
+              </span>
+            </Space>
+            <Form form={reviewForm} layout="vertical">
+              <Form.Item name="reviewer" label="复核人" rules={[{ required: true, message: '请填写复核人' }]}>
+                <Input placeholder="如 刘振国" />
+              </Form.Item>
+              <Form.Item name="reviewRemark" label="复核意见" rules={[{ required: true, message: '请填写复核意见' }]}>
+                <Input.TextArea rows={3} placeholder="如 换管后累计变化恢复正常，原黄色预警处置结论维持不变" />
+              </Form.Item>
+            </Form>
+          </>
+        ) : null}
       </Modal>
     </div>
   )

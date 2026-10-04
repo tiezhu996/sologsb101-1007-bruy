@@ -4,6 +4,7 @@
 import type { AlarmLevel } from '@/types/alarm'
 import type { Observation } from '@/types/observation'
 import type { TrendPoint } from '@/types/observation'
+import type { BaselineHandover } from '@/types/baseline'
 
 /** 各级预警对应的“累计变化量 / 阈值”比例下限 */
 export const ALARM_RATIO: Record<AlarmLevel, number> = { 蓝: 0.7, 黄: 0.85, 橙: 1.0, 红: 1.3 }
@@ -98,6 +99,88 @@ export function buildTrendPoints(observations: Observation[]): TrendPoint[] {
     dailyRate: row.dailyRate
   }))
 }
+
+/* ============================== 基准移交口径 ============================== */
+
+/** 某测点的移交链按生效日期升序 */
+export function sortedHandovers(handovers: BaselineHandover[]): BaselineHandover[] {
+  return [...handovers].sort((a, b) => a.effectiveDate.localeCompare(b.effectiveDate) || a.createdAt - b.createdAt)
+}
+
+/**
+ * 某观测日期应使用的基准初值：换管当天（含）起用新管初值。
+ * handovers 为该测点全部已完成移交（可不排序）。
+ */
+export function baselineInitialForDate(
+  baseInitialValue: number,
+  handovers: BaselineHandover[],
+  date: string
+): { initialValue: number; baselineId: string | null; handover: BaselineHandover | null } {
+  const chain = sortedHandovers(handovers)
+  // 取“最后一个生效日不晚于 date”的移交；均不满足则仍在原始基准
+  const current = chain.reduce<BaselineHandover | null>((acc, item) => (item.effectiveDate <= date ? item : acc), null)
+  return {
+    initialValue: current ? current.newInitialValue : baseInitialValue,
+    baselineId: current ? current.id : null,
+    handover: current
+  }
+}
+
+export interface BaselineResolution {
+  /** 该观测应归属的基准 id（null = 原始基准） */
+  baselineId: string | null
+  /** 该基准下的初值 */
+  initialValue: number
+  /** 生效移交（若在新基准上） */
+  handover: BaselineHandover | null
+  /** 是否处于新基准（换管当天起） */
+  isNew: boolean
+}
+
+/**
+ * 解析一条观测归属的基准：
+ * - 已存储观测以行内 baselineId 为准：历史移交前的观测 baselineId 为 null，
+ *   即使日期晚于后来登记的换管日，也仍挂在旧基准、保留当时累计结果；
+ * - 尚未写入的录入预览（fallbackByDate=true）才按日期回退判定。
+ * 注意：换管后 point.initialValue 已切换为最新新管初值，原始基准行须用
+ * 首次移交的 previousInitialValue（即换管前初值），中间各段用该段移交的新管初值。
+ */
+export function resolveObservationBaseline(
+  baseInitialValue: number,
+  handovers: BaselineHandover[],
+  observation: Pick<Observation, 'date' | 'baselineId'>,
+  options: { fallbackByDate?: boolean } = {}
+): BaselineResolution {
+  const chain = sortedHandovers(handovers)
+  const originalInitialValue = chain.length > 0 ? chain[0].previousInitialValue : baseInitialValue
+  const byId = new Map(chain.map((item) => [item.id, item]))
+  if (observation.baselineId) {
+    const hit = byId.get(observation.baselineId)
+    if (hit) return { baselineId: hit.id, initialValue: hit.newInitialValue, handover: hit, isNew: true }
+  }
+  if (observation.baselineId === null && !options.fallbackByDate) {
+    return { baselineId: null, initialValue: originalInitialValue, handover: null, isNew: false }
+  }
+  const { initialValue, baselineId, handover } = baselineInitialForDate(baseInitialValue, chain, observation.date)
+  if (handover) return { baselineId, initialValue, handover, isNew: true }
+  return { baselineId: null, initialValue: originalInitialValue, handover: null, isNew: false }
+}
+
+/** 换管当天起的“展示累计变化”：读数 − 当日所属基准初值 */
+export function effectiveCumulative(
+  baseInitialValue: number,
+  handovers: BaselineHandover[],
+  observation: Observation
+): number {
+  const { initialValue } = resolveObservationBaseline(baseInitialValue, handovers, observation)
+  return cumulativeOf(observation.reading, initialValue)
+}
+
+/** 基准标签：旧基准 / 第 N 段新基准 */
+export function baselineLabel(seq: number | null): string {
+  return seq === null ? '旧基准' : `新基准${seq > 1 ? `(第${seq}段)` : ''}`
+}
+
 
 /** 毫米 → 米 */
 export function mmToM(value: number): number {

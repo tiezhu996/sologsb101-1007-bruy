@@ -10,15 +10,23 @@ import type { Point } from '@/types/point'
 import type { Observation } from '@/types/observation'
 import type { Alarm } from '@/types/alarm'
 import type { Pool } from '@/types/pool'
-import { cumulativeOf, dailyRateOf, daysBetween } from '@/utils/threshold'
+import type { BaselineHandover, BaselineReview, HandoverDraft } from '@/types/baseline'
+import {
+  alarmLevelOf,
+  baselineInitialForDate,
+  cumulativeOf,
+  dailyRateOf,
+  daysBetween
+} from '@/utils/threshold'
 
 export const DB_NAME = 'gbtaildam'
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 export const LS_KEYS = {
   dbVersion: 'gbtaildam:db-version',
   lastBackupAt: 'gbtaildam:last-backup-at',
-  uiPrefs: 'gbtaildam:ui-prefs'
+  uiPrefs: 'gbtaildam:ui-prefs',
+  handoverDrafts: 'gbtaildam:handover-drafts'
 } as const
 
 export interface UiPrefs {
@@ -38,13 +46,15 @@ export interface BackupPayload {
   observations: Observation[]
   alarms: Alarm[]
   pools: Pool[]
+  baselineHandovers: BaselineHandover[]
+  baselineReviews: BaselineReview[]
 }
 
 export interface Revisioned {
   revision?: number
 }
 
-export const ROW_REVISION = 2
+export const ROW_REVISION = 3
 
 export type DamRow = Dam & Revisioned
 export type SectionRow = Section & Revisioned
@@ -52,6 +62,16 @@ export type PointRow = Point & Revisioned
 export type ObservationRow = Observation & Revisioned
 export type AlarmRow = Alarm & Revisioned
 export type PoolRow = Pool & Revisioned
+export type BaselineHandoverRow = BaselineHandover & Revisioned
+export type BaselineReviewRow = BaselineReview & Revisioned
+
+/** 提交基准移交时的冲突：后到的移交不能覆盖先完成的移交 */
+export class HandoverConflictError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'HandoverConflictError'
+  }
+}
 
 class TailDamDatabase extends Dexie {
   dams!: Table<DamRow, string>
@@ -60,6 +80,8 @@ class TailDamDatabase extends Dexie {
   observations!: Table<ObservationRow, string>
   alarms!: Table<AlarmRow, string>
   pools!: Table<PoolRow, string>
+  baselineHandovers!: Table<BaselineHandoverRow, string>
+  baselineReviews!: Table<BaselineReviewRow, string>
 
   constructor() {
     super(DB_NAME)
@@ -74,7 +96,7 @@ class TailDamDatabase extends Dexie {
     })
 
     // v2：测点/预警补 damId 冗余列（按坝体筛选免联表）；全部表补 revision 行修订号
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         dams: 'id, name, damType, grade, updatedAt',
         sections: 'id, damId, stakeNo, updatedAt',
@@ -123,6 +145,23 @@ class TailDamDatabase extends Dexie {
             if (typeof alarm.measure !== 'string') alarm.measure = ''
           })
       })
+
+    // v3：基准移交（换管）与级别复核；观测挂基准 id，历史行不加索引回退判定
+    this.version(DB_VERSION)
+      .stores({
+        observations: 'id, pointId, date, baselineId, observer, updatedAt',
+        baselineHandovers: 'id, pointId, damId, effectiveDate, updatedAt',
+        baselineReviews: 'id, pointId, damId, handoverId, status, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        // 历史观测保留当时结果：baselineId 缺失即视为挂在原始（旧）基准，不改写累计量
+        await tx
+          .table('observations')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            if (row.baselineId === undefined) row.baselineId = null
+          })
+      })
   }
 }
 
@@ -162,29 +201,76 @@ const SEED_POINTS: PointRow[] = [
   { id: 'pt-9', sectionId: 'sec-4', damId: 'dam-2', code: 'SY-02', type: '渗压', initialValue: 38.5, threshold: 6, unit: 'kPa', installDate: '2022-05-18', createdAt: stamp(-339), updatedAt: stamp(-1), revision: ROW_REVISION }
 ]
 
-/** 播种用的观测原始行：[测点, 日期, 读数, 观测人] */
-const SEED_OBSERVATION_ROWS: Array<[string, string, number, string]> = [
-  ['pt-1', '2024-04-10', 8.2, '刘振国'],
-  ['pt-1', '2024-05-10', 15.4, '刘振国'],
-  ['pt-1', '2024-06-09', 27.4, '陈文'],
-  ['pt-2', '2024-04-10', 9.6, '刘振国'],
-  ['pt-2', '2024-05-10', 16.2, '陈文'],
-  ['pt-2', '2024-06-09', 27.9, '陈文'],
-  ['pt-3', '2024-04-11', 12.8, '王丽'],
-  ['pt-3', '2024-05-11', 13.4, '王丽'],
-  ['pt-3', '2024-06-10', 14.9, '王丽'],
-  ['pt-4', '2024-04-11', 5.4, '刘振国'],
-  ['pt-4', '2024-06-10', 11.2, '刘振国'],
-  ['pt-5', '2024-04-12', 46.8, '王丽'],
-  ['pt-5', '2024-06-11', 51.6, '王丽'],
-  ['pt-6', '2024-04-12', 13.3, '陈文'],
-  ['pt-6', '2024-06-11', 13.9, '陈文'],
-  ['pt-7', '2024-04-13', 6.8, '赵鹏'],
-  ['pt-7', '2024-06-11', 14.2, '赵鹏'],
-  ['pt-8', '2024-04-13', 7.5, '赵鹏'],
-  ['pt-8', '2024-06-11', 18.4, '赵鹏'],
-  ['pt-9', '2024-04-14', 39.6, '赵鹏'],
-  ['pt-9', '2024-06-11', 44.2, '赵鹏']
+/** 播种用的观测原始行：[测点, 日期, 读数, 观测人, 基准移交 id] */
+const SEED_OBSERVATION_ROWS: Array<[string, string, number, string, string | null]> = [
+  ['pt-1', '2024-04-10', 8.2, '刘振国', null],
+  ['pt-1', '2024-05-10', 15.4, '刘振国', null],
+  ['pt-1', '2024-06-09', 27.4, '陈文', null],
+  ['pt-2', '2024-04-10', 9.6, '刘振国', null],
+  ['pt-2', '2024-05-10', 16.2, '陈文', null],
+  ['pt-2', '2024-06-09', 27.9, '陈文', null],
+  ['pt-2', '2024-06-12', 2.1, '陈文', 'hd-1'],
+  ['pt-3', '2024-04-11', 12.8, '王丽', null],
+  ['pt-3', '2024-05-11', 13.4, '王丽', null],
+  ['pt-3', '2024-06-10', 14.9, '王丽', null],
+  ['pt-4', '2024-04-11', 5.4, '刘振国', null],
+  ['pt-4', '2024-06-10', 11.2, '刘振国', null],
+  ['pt-5', '2024-04-12', 46.8, '王丽', null],
+  ['pt-5', '2024-06-11', 51.6, '王丽', null],
+  ['pt-6', '2024-04-12', 13.3, '陈文', null],
+  ['pt-6', '2024-06-11', 13.9, '陈文', null],
+  ['pt-7', '2024-04-13', 6.8, '赵鹏', null],
+  ['pt-7', '2024-06-11', 14.2, '赵鹏', null],
+  ['pt-8', '2024-04-13', 7.5, '赵鹏', null],
+  ['pt-8', '2024-06-11', 18.4, '赵鹏', null],
+  ['pt-9', '2024-04-14', 39.6, '赵鹏', null],
+  ['pt-9', '2024-06-11', 44.2, '赵鹏', null]
+]
+
+/**
+ * 播种的基准移交：pt-2（CX-01 测斜）于 2024-06-10 换管。
+ * 旧管末次读数 27.9（2024-06-09，曾触发 al-4 黄色预警并已闭环），
+ * 新管初值 0；换管后 2024-06-12 读数 2.1 按新基准累计，级别由黄转正常 → 待复核。
+ */
+const SEED_HANDOVERS: BaselineHandoverRow[] = [
+  {
+    id: 'hd-1',
+    pointId: 'pt-2',
+    damId: 'dam-1',
+    seq: 1,
+    effectiveDate: '2024-06-10',
+    oldLastReadingDate: '2024-06-09',
+    oldLastReading: 27.9,
+    previousInitialValue: 0,
+    newInitialValue: 0,
+    reason: '测斜管换新',
+    note: '原测斜管变形损坏，更换新测斜管并重新测读初值；旧管预警已闭环，历史观测保留原口径。',
+    operator: '陈文',
+    createdAt: stamp(-1),
+    updatedAt: stamp(-1),
+    revision: ROW_REVISION
+  }
+]
+
+const SEED_REVIEWS: BaselineReviewRow[] = [
+  {
+    id: 'rv-1',
+    pointId: 'pt-2',
+    damId: 'dam-1',
+    handoverId: 'hd-1',
+    effectiveDate: '2024-06-10',
+    fromLevel: '黄',
+    toLevel: null,
+    fromCumulative: 27.9,
+    toCumulative: 2.1,
+    status: '待复核',
+    reviewer: '',
+    reviewRemark: '',
+    createdAt: stamp(-1),
+    reviewedAt: null,
+    updatedAt: stamp(-1),
+    revision: ROW_REVISION
+  }
 ]
 
 const SEED_ALARMS: AlarmRow[] = [
@@ -204,12 +290,13 @@ const SEED_POOLS: PoolRow[] = [
   { id: 'pl-5', damId: 'dam-2', date: '2024-06-09', waterLevelM: 643.4, beachLengthM: 74, freeboardM: 1.8, createdAt: stamp(-2), updatedAt: stamp(-2), revision: ROW_REVISION }
 ]
 
-/** 由原始行派生累计变化量与日速率 */
+/** 由原始行派生累计变化量与日速率（累计量按观测当日所属基准；速率只看相邻原始读数） */
 function buildSeedObservations(): ObservationRow[] {
   const previousByPoint = new Map<string, { date: string; reading: number }>()
-  return SEED_OBSERVATION_ROWS.map(([pointId, date, reading, observer], index) => {
+  return SEED_OBSERVATION_ROWS.map(([pointId, date, reading, observer, baselineId], index) => {
     const point = SEED_POINTS.find((item) => item.id === pointId)
-    const initialValue = point ? point.initialValue : 0
+    const handovers = SEED_HANDOVERS.filter((item) => item.pointId === pointId)
+    const { initialValue } = baselineInitialForDate(point ? point.initialValue : 0, handovers, date)
     const previous = previousByPoint.get(pointId)
     const dailyRate = previous ? dailyRateOf(reading, previous.reading, daysBetween(previous.date, date)) : 0
     previousByPoint.set(pointId, { date, reading })
@@ -220,6 +307,7 @@ function buildSeedObservations(): ObservationRow[] {
       reading,
       cumulative: cumulativeOf(reading, initialValue),
       dailyRate,
+      baselineId,
       observer,
       createdAt: stamp(-200 + index),
       updatedAt: stamp(-200 + index),
@@ -229,14 +317,20 @@ function buildSeedObservations(): ObservationRow[] {
 }
 
 export async function seedDatabase(): Promise<void> {
-  await db.transaction('rw', [db.dams, db.sections, db.points, db.observations, db.alarms, db.pools], async () => {
-    await db.dams.bulkPut(SEED_DAMS)
-    await db.sections.bulkPut(SEED_SECTIONS)
-    await db.points.bulkPut(SEED_POINTS)
-    await db.observations.bulkPut(buildSeedObservations())
-    await db.alarms.bulkPut(SEED_ALARMS)
-    await db.pools.bulkPut(SEED_POOLS)
-  })
+  await db.transaction(
+    'rw',
+    [db.dams, db.sections, db.points, db.observations, db.alarms, db.pools, db.baselineHandovers, db.baselineReviews],
+    async () => {
+      await db.dams.bulkPut(SEED_DAMS)
+      await db.sections.bulkPut(SEED_SECTIONS)
+      await db.points.bulkPut(SEED_POINTS)
+      await db.observations.bulkPut(buildSeedObservations())
+      await db.alarms.bulkPut(SEED_ALARMS)
+      await db.pools.bulkPut(SEED_POOLS)
+      await db.baselineHandovers.bulkPut(SEED_HANDOVERS)
+      await db.baselineReviews.bulkPut(SEED_REVIEWS)
+    }
+  )
 }
 
 /** 首屏调用：打开数据库并在主表为空时播种演示数据 */
@@ -267,11 +361,21 @@ export async function deleteSectionCascade(sectionId: string): Promise<void> {
 }
 
 export async function deletePointCascade(pointId: string): Promise<void> {
-  await db.transaction('rw', db.points, db.observations, db.alarms, async () => {
-    await db.observations.where('pointId').equals(pointId).delete()
-    await db.alarms.where('pointId').equals(pointId).delete()
-    await db.points.delete(pointId)
-  })
+  await db.transaction(
+    'rw',
+    db.points,
+    db.observations,
+    db.alarms,
+    db.baselineHandovers,
+    db.baselineReviews,
+    async () => {
+      await db.observations.where('pointId').equals(pointId).delete()
+      await db.alarms.where('pointId').equals(pointId).delete()
+      await db.baselineHandovers.where('pointId').equals(pointId).delete()
+      await db.baselineReviews.where('pointId').equals(pointId).delete()
+      await db.points.delete(pointId)
+    }
+  )
 }
 
 async function deletePointsOfSections(sectionIds: string[]): Promise<void> {
@@ -281,6 +385,8 @@ async function deletePointsOfSections(sectionIds: string[]): Promise<void> {
   if (pointIds.length > 0) {
     await db.observations.where('pointId').anyOf(pointIds).delete()
     await db.alarms.where('pointId').anyOf(pointIds).delete()
+    await db.baselineHandovers.where('pointId').anyOf(pointIds).delete()
+    await db.baselineReviews.where('pointId').anyOf(pointIds).delete()
     await db.points.bulkDelete(pointIds)
   }
 }
@@ -288,25 +394,29 @@ async function deletePointsOfSections(sectionIds: string[]): Promise<void> {
 /* ============================ 整库导入导出 ============================ */
 
 export async function countAll(): Promise<Record<string, number>> {
-  const [dams, sections, points, observations, alarms, pools] = await Promise.all([
+  const [dams, sections, points, observations, alarms, pools, baselineHandovers, baselineReviews] = await Promise.all([
     db.dams.count(),
     db.sections.count(),
     db.points.count(),
     db.observations.count(),
     db.alarms.count(),
-    db.pools.count()
+    db.pools.count(),
+    db.baselineHandovers.count(),
+    db.baselineReviews.count()
   ])
-  return { dams, sections, points, observations, alarms, pools }
+  return { dams, sections, points, observations, alarms, pools, baselineHandovers, baselineReviews }
 }
 
 export async function exportSnapshot(): Promise<BackupPayload> {
-  const [dams, sections, points, observations, alarms, pools] = await Promise.all([
+  const [dams, sections, points, observations, alarms, pools, baselineHandovers, baselineReviews] = await Promise.all([
     db.dams.toArray(),
     db.sections.toArray(),
     db.points.toArray(),
     db.observations.toArray(),
     db.alarms.toArray(),
-    db.pools.toArray()
+    db.pools.toArray(),
+    db.baselineHandovers.toArray(),
+    db.baselineReviews.toArray()
   ])
   const strip = <T extends Revisioned>(row: T): Omit<T, 'revision'> => {
     const { revision: _revision, ...rest } = row
@@ -321,41 +431,80 @@ export async function exportSnapshot(): Promise<BackupPayload> {
     points: points.map(strip),
     observations: observations.map(strip),
     alarms: alarms.map(strip),
-    pools: pools.map(strip)
+    pools: pools.map(strip),
+    baselineHandovers: baselineHandovers.map(strip),
+    baselineReviews: baselineReviews.map(strip)
   }
 }
 
 export async function importSnapshot(payload: BackupPayload): Promise<void> {
-  await db.transaction('rw', [db.dams, db.sections, db.points, db.observations, db.alarms, db.pools], async () => {
-    await Promise.all([
-      db.dams.clear(),
-      db.sections.clear(),
-      db.points.clear(),
-      db.observations.clear(),
-      db.alarms.clear(),
-      db.pools.clear()
-    ])
-    const rev = <T>(row: T): T & Revisioned => ({ ...row, revision: ROW_REVISION })
-    await db.dams.bulkPut((payload.dams ?? []).map(rev))
-    await db.sections.bulkPut((payload.sections ?? []).map(rev))
-    await db.points.bulkPut((payload.points ?? []).map(rev))
-    await db.observations.bulkPut((payload.observations ?? []).map(rev))
-    await db.alarms.bulkPut((payload.alarms ?? []).map(rev))
-    await db.pools.bulkPut((payload.pools ?? []).map(rev))
-  })
+  await db.transaction(
+    'rw',
+    [
+      db.dams,
+      db.sections,
+      db.points,
+      db.observations,
+      db.alarms,
+      db.pools,
+      db.baselineHandovers,
+      db.baselineReviews
+    ],
+    async () => {
+      await Promise.all([
+        db.dams.clear(),
+        db.sections.clear(),
+        db.points.clear(),
+        db.observations.clear(),
+        db.alarms.clear(),
+        db.pools.clear(),
+        db.baselineHandovers.clear(),
+        db.baselineReviews.clear()
+      ])
+      const rev = <T>(row: T): T & Revisioned => ({ ...row, revision: ROW_REVISION })
+      // 旧版备份可能缺少新表与 baselineId，兜底补齐，保证观测仍挂在旧基准
+      await db.dams.bulkPut((payload.dams ?? []).map(rev))
+      await db.sections.bulkPut((payload.sections ?? []).map(rev))
+      await db.points.bulkPut((payload.points ?? []).map(rev))
+      await db.observations.bulkPut(
+        (payload.observations ?? []).map((row) =>
+          rev({ ...row, baselineId: row.baselineId === undefined ? null : row.baselineId })
+        )
+      )
+      await db.alarms.bulkPut((payload.alarms ?? []).map(rev))
+      await db.pools.bulkPut((payload.pools ?? []).map(rev))
+      await db.baselineHandovers.bulkPut((payload.baselineHandovers ?? []).map(rev))
+      await db.baselineReviews.bulkPut((payload.baselineReviews ?? []).map(rev))
+    }
+  )
 }
 
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', [db.dams, db.sections, db.points, db.observations, db.alarms, db.pools], async () => {
-    await Promise.all([
-      db.dams.clear(),
-      db.sections.clear(),
-      db.points.clear(),
-      db.observations.clear(),
-      db.alarms.clear(),
-      db.pools.clear()
-    ])
-  })
+  await db.transaction(
+    'rw',
+    [
+      db.dams,
+      db.sections,
+      db.points,
+      db.observations,
+      db.alarms,
+      db.pools,
+      db.baselineHandovers,
+      db.baselineReviews
+    ],
+    async () => {
+      await Promise.all([
+        db.dams.clear(),
+        db.sections.clear(),
+        db.points.clear(),
+        db.observations.clear(),
+        db.alarms.clear(),
+        db.pools.clear(),
+        db.baselineHandovers.clear(),
+        db.baselineReviews.clear()
+      ])
+    }
+  )
 }
 
 export async function resetDatabase(): Promise<void> {
@@ -363,45 +512,220 @@ export async function resetDatabase(): Promise<void> {
   await seedDatabase()
 }
 
-/** 观测录入：写入累计变化量与日速率 */
+/**
+ * 观测录入：累计量按观测当日所属基准计算（换管当天起用新管初值）；
+ * 日速率只按相邻原始读数差值 ÷ 间隔天数，跨换管边界不变。
+ */
 export async function putObservation(
-  row: Omit<Observation, 'cumulative' | 'dailyRate'> & { cumulative?: number; dailyRate?: number }
-): Promise<ObservationRow> {
-  const point = await db.points.get(row.pointId)
-  const initialValue = point ? point.initialValue : 0
-  const others = (await db.observations.where('pointId').equals(row.pointId).toArray())
-    .filter((item) => item.id !== row.id)
-    .sort((a, b) => a.date.localeCompare(b.date))
-  const previous = others.filter((item) => item.date < row.date).pop() ?? null
-  const cumulative = cumulativeOf(row.reading, initialValue)
-  const dailyRate = previous ? dailyRateOf(row.reading, previous.reading, daysBetween(previous.date, row.date)) : 0
-  const next: ObservationRow = {
-    ...row,
-    cumulative,
-    dailyRate,
-    revision: ROW_REVISION
+  row: Omit<Observation, 'cumulative' | 'dailyRate' | 'baselineId'> & {
+    cumulative?: number
+    dailyRate?: number
+    baselineId?: string | null
   }
-  await db.observations.put(next)
-  return next
+): Promise<ObservationRow> {
+  return db.transaction('rw', [db.points, db.observations, db.baselineHandovers], async () => {
+    const point = await db.points.get(row.pointId)
+    const handovers = await db.baselineHandovers.where('pointId').equals(row.pointId).toArray()
+    const baseInitialValue = point ? point.initialValue : 0
+    const { initialValue, baselineId } = baselineInitialForDate(baseInitialValue, handovers, row.date)
+    const others = (await db.observations.where('pointId').equals(row.pointId).toArray())
+      .filter((item) => item.id !== row.id)
+      .sort((a, b) => a.date.localeCompare(b.date))
+    const previous = others.filter((item) => item.date < row.date).pop() ?? null
+    const cumulative = cumulativeOf(row.reading, initialValue)
+    const dailyRate = previous ? dailyRateOf(row.reading, previous.reading, daysBetween(previous.date, row.date)) : 0
+    const next: ObservationRow = {
+      ...row,
+      cumulative,
+      dailyRate,
+      baselineId: row.baselineId !== undefined ? row.baselineId : baselineId,
+      revision: ROW_REVISION
+    }
+    await db.observations.put(next)
+    return next
+  })
 }
 
-/** 重算某测点全部观测的累计变化量与日速率 */
+/**
+ * 重算某测点观测：历史行累计量保留观测当时结果（挂在各自基准，绝不重写），
+ * 仅按相邻原始读数重算日速率；baselineId 缺失的历史行补挂原始基准。
+ */
 export async function recalculateObservations(pointId: string): Promise<void> {
-  const point = await db.points.get(pointId)
-  const initialValue = point ? point.initialValue : 0
   const rows = (await db.observations.where('pointId').equals(pointId).toArray()).sort((a, b) =>
     a.date.localeCompare(b.date)
   )
+  const now = Date.now()
   const patches = rows.map((row, index) => {
     const previous = index === 0 ? null : rows[index - 1]
     return {
       ...row,
-      cumulative: cumulativeOf(row.reading, initialValue),
+      // 累计量不重算，保证原观测保留当时结果
       dailyRate: previous ? dailyRateOf(row.reading, previous.reading, daysBetween(previous.date, row.date)) : 0,
-      updatedAt: Date.now()
+      baselineId: row.baselineId ?? null,
+      updatedAt: now
     }
   })
   if (patches.length > 0) await db.observations.bulkPut(patches)
+}
+
+/* ============================ 基准移交（换管） ============================ */
+
+export interface SubmitHandoverInput {
+  pointId: string
+  effectiveDate: string
+  oldLastReadingDate: string
+  oldLastReading: number
+  newInitialValue: number
+  reason: BaselineHandover['reason']
+  note: string
+  operator: string
+}
+
+export interface SubmitHandoverResult {
+  handover: BaselineHandoverRow
+  review: BaselineReviewRow | null
+}
+
+/**
+ * 提交基准移交（单事务）：
+ * - 后到的移交不能覆盖先完成的移交：生效日必须严格晚于该测点已存在的最晚生效日；
+ * - 更新测点当前初值为新管初值；原观测不改写，保留当时结果并挂旧基准；
+ * - 按旧管末次读数（旧基准）与新基准下最新读数对比级别，级别变化生成待复核项；
+ * - 已闭环预警不做任何重算或改写。
+ */
+export async function submitBaselineHandover(input: SubmitHandoverInput): Promise<SubmitHandoverResult> {
+  return db.transaction(
+    'rw',
+    [db.points, db.observations, db.baselineHandovers, db.baselineReviews],
+    async () => {
+      const point = await db.points.get(input.pointId)
+      if (!point) throw new Error('测点不存在或已删除')
+
+      const existing = await db.baselineHandovers.where('pointId').equals(input.pointId).toArray()
+      const latestDate = existing
+        .map((item) => item.effectiveDate)
+        .sort()
+        .pop()
+      if (latestDate && input.effectiveDate <= latestDate) {
+        throw new HandoverConflictError(
+          `该测点已存在 ${latestDate} 完成的基准移交，后到的移交不能覆盖先完成的记录，请使用更晚的换管日期`
+        )
+      }
+
+      const now = Date.now()
+      const seq = existing.length + 1
+      const previousInitialValue = latestDate
+        ? (existing.find((item) => item.effectiveDate === latestDate)?.newInitialValue ?? point.initialValue)
+        : point.initialValue
+
+      const handover: BaselineHandoverRow = {
+        id: createId('hd'),
+        pointId: input.pointId,
+        damId: point.damId,
+        seq,
+        effectiveDate: input.effectiveDate,
+        oldLastReadingDate: input.oldLastReadingDate,
+        oldLastReading: Number(input.oldLastReading) || 0,
+        previousInitialValue,
+        newInitialValue: Number(input.newInitialValue) || 0,
+        reason: input.reason,
+        note: input.note.trim(),
+        operator: input.operator.trim() || '未署名',
+        createdAt: now,
+        updatedAt: now,
+        revision: ROW_REVISION
+      }
+
+      // 级别变化复核：旧侧按旧管末次读数 + 旧基准初值；新侧按换管当天起最新读数 + 新管初值
+      const fromCumulative = cumulativeOf(handover.oldLastReading, previousInitialValue)
+      const fromLevel = alarmLevelOf(fromCumulative, point.threshold)
+      const newSideLatest = (await db.observations.where('pointId').equals(input.pointId).toArray())
+        .filter((item) => item.date >= input.effectiveDate)
+        .sort((a, b) => b.date.localeCompare(a.date))[0]
+      const toCumulative = newSideLatest ? cumulativeOf(newSideLatest.reading, handover.newInitialValue) : null
+      const toLevel = toCumulative === null ? null : alarmLevelOf(toCumulative, point.threshold)
+
+      let review: BaselineReviewRow | null = null
+      if (fromLevel !== toLevel) {
+        review = {
+          id: createId('rv'),
+          pointId: input.pointId,
+          damId: point.damId,
+          handoverId: handover.id,
+          effectiveDate: input.effectiveDate,
+          fromLevel,
+          toLevel,
+          fromCumulative,
+          toCumulative,
+          status: '待复核',
+          reviewer: '',
+          reviewRemark: '',
+          createdAt: now,
+          reviewedAt: null,
+          updatedAt: now,
+          revision: ROW_REVISION
+        }
+      }
+
+      await db.baselineHandovers.put(handover)
+      if (review) await db.baselineReviews.put(review)
+      // 历史观测不改写；仅切换当前初值，换管当天起新录入按新基准计算
+      await db.points.update(input.pointId, { initialValue: handover.newInitialValue, updatedAt: now })
+
+      return { handover, review }
+    }
+  )
+}
+
+/** 复核结论回写（只改复核项，不动预警与历史观测） */
+export async function resolveBaselineReview(
+  reviewId: string,
+  reviewer: string,
+  reviewRemark: string
+): Promise<void> {
+  await db.baselineReviews.update(reviewId, {
+    status: '已复核',
+    reviewer: reviewer.trim() || '未署名',
+    reviewRemark: reviewRemark.trim(),
+    reviewedAt: Date.now(),
+    updatedAt: Date.now()
+  })
+}
+
+/* ====================== 移交草稿（写入失败可重试） ====================== */
+
+type HandoverDraftMap = Record<string, HandoverDraft>
+
+export function readHandoverDrafts(): HandoverDraftMap {
+  try {
+    const raw = localStorage.getItem(LS_KEYS.handoverDrafts)
+    if (!raw) return {}
+    const parsed = JSON.parse(raw) as unknown
+    if (!parsed || typeof parsed !== 'object') return {}
+    const result: HandoverDraftMap = {}
+    Object.entries(parsed as Record<string, unknown>).forEach(([pointId, value]) => {
+      if (value && typeof value === 'object') result[pointId] = { ...(value as HandoverDraft), pointId }
+    })
+    return result
+  } catch {
+    return {}
+  }
+}
+
+export function writeHandoverDrafts(drafts: HandoverDraftMap): void {
+  localStorage.setItem(LS_KEYS.handoverDrafts, JSON.stringify(drafts))
+}
+
+export function saveHandoverDraft(draft: HandoverDraft): void {
+  const drafts = readHandoverDrafts()
+  drafts[draft.pointId] = draft
+  writeHandoverDrafts(drafts)
+}
+
+export function clearHandoverDraft(pointId: string): void {
+  const drafts = readHandoverDrafts()
+  delete drafts[pointId]
+  writeHandoverDrafts(drafts)
 }
 
 /* ============================ 本地 UI 偏好 ============================ */

@@ -10,20 +10,24 @@ import AlarmTag from '@/components/common/AlarmTag'
 import EmptyPanel from '@/components/common/EmptyPanel'
 import FilterBar, { type FilterModel } from '@/components/common/FilterBar'
 import StatBadge from '@/components/common/StatBadge'
+import BaselineTag from '@/components/baseline/BaselineTag'
 import { useDamStore } from '@/stores/damStore'
 import { usePointStore } from '@/stores/pointStore'
 import { useAlarmStore } from '@/stores/alarmStore'
+import { useBaselineStore } from '@/stores/baselineStore'
 import { useAlarmLevel } from '@/hooks/useAlarmLevel'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { db, putObservation, type ObservationRow } from '@/utils/db'
 import { POINT_TYPES, type Point, type PointType } from '@/types/point'
 import type { ObservationDraft } from '@/types/observation'
+import { baselineInitialForDate, resolveObservationBaseline } from '@/utils/threshold'
 
 export default function ObservationEntry() {
   const { message } = AntdApp.useApp()
   const damStore = useDamStore()
   const pointStore = usePointStore()
   const alarmStore = useAlarmStore()
+  const baselineStore = useBaselineStore()
   const alarmLevel = useAlarmLevel()
   const observationTable = useIdbTable<ObservationRow>(db.observations, { sortByUpdatedAt: false })
 
@@ -76,9 +80,14 @@ export default function ObservationEntry() {
 
   const draftReading = Form.useWatch('reading', form)
   const draftDate = Form.useWatch('date', form)
+  const activeHandovers = activePoint ? baselineStore.handoversOfPoint(activePoint.id) : []
+  const activeBaseline =
+    activePoint && typeof draftDate === 'string' && draftDate
+      ? baselineInitialForDate(activePoint.initialValue, activeHandovers, draftDate)
+      : null
   const preview =
-    activePoint && typeof draftReading === 'number'
-      ? alarmLevel.evaluate(activePoint, draftReading)
+    activePoint && typeof draftReading === 'number' && activeBaseline
+      ? alarmLevel.evaluate(activePoint, draftReading, activeBaseline.initialValue)
       : null
 
   const openCreate = (): void => {
@@ -88,10 +97,16 @@ export default function ObservationEntry() {
     }
     setEditingId(null)
     const latest = observationsOfActive[0]
+    const today = new Date().toISOString().slice(0, 10)
+    const baselineToday = baselineInitialForDate(
+      activePoint.initialValue,
+      baselineStore.handoversOfPoint(activePoint.id),
+      today
+    )
     form.setFieldsValue({
       pointId: activePoint.id,
-      date: new Date().toISOString().slice(0, 10),
-      reading: latest ? latest.reading : activePoint.initialValue,
+      date: today,
+      reading: latest ? latest.reading : baselineToday.initialValue,
       observer: ''
     })
     setOpen(true)
@@ -154,29 +169,56 @@ export default function ObservationEntry() {
       message.info('当前读数未越限，无需生成预警单')
       return
     }
-    const result = alarmLevel.buildDraft(activePoint, draftDate || new Date().toISOString().slice(0, 10), Number(draftReading))
+    const result = alarmLevel.buildDraft(
+      activePoint,
+      draftDate || new Date().toISOString().slice(0, 10),
+      Number(draftReading),
+      activeBaseline?.initialValue
+    )
     if (!result) return
     await alarmStore.createAlarm({ ...result.draft, measure: result.basis })
-    message.success(`已生成${result.draft.level}色预警单`)
+    message.success(`已生成${result.draft.level}色预警单（按${activeBaseline?.handover ? '新' : '原'}基准判定）`)
   }
 
   const columns: TableColumnsType<ObservationRow> = [
     { title: '日期', dataIndex: 'date', width: 120 },
     { title: '读数', dataIndex: 'reading', width: 120, render: (value: number) => value.toFixed(3) },
     {
-      title: '累计变化',
-      dataIndex: 'cumulative',
-      width: 130,
-      render: (value: number) => <span style={{ color: value >= 0 ? '#b03a2e' : '#2f7a4f' }}>{value.toFixed(3)}</span>
+      title: '基准 / 累计变化',
+      width: 200,
+      render: (_value, record) => {
+        const point = pointStore.points.find((item) => item.id === record.pointId)
+        if (!point) return <span className="muted">测点已删除</span>
+        const handovers = baselineStore.handoversOfPoint(point.id)
+        const resolution = resolveObservationBaseline(point.initialValue, handovers, record)
+        // 累计变化保留观测当时结果：旧基准行挂旧基准，新基准行按新管初值，均已在写入时固化
+        const shown = record.cumulative
+        return (
+          <Space size={6}>
+            <BaselineTag handover={resolution.handover} />
+            <span style={{ color: shown >= 0 ? '#b03a2e' : '#2f7a4f' }}>{shown.toFixed(3)}</span>
+          </Space>
+        )
+      }
     },
-    { title: '日速率', dataIndex: 'dailyRate', width: 120, render: (value: number) => value.toFixed(4) },
+    {
+      title: '日速率',
+      dataIndex: 'dailyRate',
+      width: 130,
+      render: (value: number) => <span title="按相邻读数间隔天数计算，跨换管不变">{value.toFixed(4)}</span>
+    },
     {
       title: '判定',
       width: 150,
       render: (_value, record) => {
         const point = pointStore.points.find((item) => item.id === record.pointId)
         if (!point) return <span className="muted">测点已删除</span>
-        const level = alarmLevel.evaluate(point, record.reading).level
+        const resolution = resolveObservationBaseline(
+          point.initialValue,
+          baselineStore.handoversOfPoint(point.id),
+          record
+        )
+        const level = alarmLevel.evaluate(point, record.reading, resolution.initialValue).level
         return level ? <AlarmTag level={level} size="small" /> : <Tag color="green">正常</Tag>
       }
     },
@@ -240,7 +282,16 @@ export default function ObservationEntry() {
               const latest = observationTable.rows
                 .filter((row) => row.pointId === point.id)
                 .sort((a, b) => b.date.localeCompare(a.date))[0]
-              const level = latest ? alarmLevel.evaluate(point, latest.reading).level : null
+              const latestLevel = latest
+                ? alarmLevel.evaluate(
+                    point,
+                    latest.reading,
+                    resolveObservationBaseline(point.initialValue, baselineStore.handoversOfPoint(point.id), latest)
+                      .initialValue
+                  ).level
+                : null
+              const level = latestLevel
+              const handoverCount = baselineStore.handoversOfPoint(point.id).length
               return (
                 <div
                   key={point.id}
@@ -248,7 +299,10 @@ export default function ObservationEntry() {
                   onClick={() => pointStore.setSelectedIds([point.id])}
                 >
                   <div className="card-list-item__head">
-                    <span>{point.code}</span>
+                    <span>
+                      {point.code}
+                      {handoverCount > 0 ? <em className="muted" style={{ fontSize: 12, marginLeft: 6 }}>已换管×{handoverCount}</em> : null}
+                    </span>
                     {level ? <AlarmTag level={level} size="small" /> : <Tag color="green">正常</Tag>}
                   </div>
                   <div className="card-list-item__meta">
@@ -273,13 +327,21 @@ export default function ObservationEntry() {
                   {activePoint.code} · 观测明细
                   <span className="muted">
                     {' '}
-                    {activePoint.type} · 初值 {activePoint.initialValue} {activePoint.unit} · 阈值 {activePoint.threshold}{' '}
+                    {activePoint.type} · 当前初值 {activePoint.initialValue} {activePoint.unit} · 阈值 {activePoint.threshold}{' '}
                     {activePoint.unit}
+                    {activeHandovers.length > 0
+                      ? ` · 已换管 ${activeHandovers.length} 次（自 ${activeHandovers[activeHandovers.length - 1].effectiveDate} 起按新基准）`
+                      : ''}
                   </span>
                 </h3>
-                <Button size="small" type="primary" onClick={openCreate}>
-                  录入观测
-                </Button>
+                <Space size={8}>
+                  {baselineStore.drafts[activePoint.id] ? (
+                    <Tag color="red">有移交草稿待重试</Tag>
+                  ) : null}
+                  <Button size="small" type="primary" onClick={openCreate}>
+                    录入观测
+                  </Button>
+                </Space>
               </div>
               {observationsOfActive.length === 0 ? (
                 <EmptyPanel
@@ -342,11 +404,15 @@ export default function ObservationEntry() {
             <Input placeholder="如 刘振国" />
           </Form.Item>
           {preview ? (
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
               <span className="muted">
-                累计变化 {preview.cumulative.toFixed(3)} · 占阈值 {(preview.ratio * 100).toFixed(1)}%
+                按{activeBaseline?.handover ? '新' : '原'}基准（初值 {(activeBaseline?.initialValue ?? 0).toFixed(3)}）累计变化{' '}
+                {preview.cumulative.toFixed(3)} · 占阈值 {(preview.ratio * 100).toFixed(1)}%
               </span>
               {preview.level ? <AlarmTag level={preview.level} /> : <Tag color="green">正常</Tag>}
+              <span className="muted" style={{ fontSize: 12 }}>
+                日速率将按相邻读数间隔天数计算（跨换管仍用原始读数）
+              </span>
             </div>
           ) : null}
         </Form>

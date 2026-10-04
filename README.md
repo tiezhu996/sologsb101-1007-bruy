@@ -53,9 +53,10 @@ sologsb101-1007/
     ├── package.json / tsconfig.json / vite.config.ts / index.html
     ├── public/favicon.svg
     └── src/
-        ├── types/              # dam.ts section.ts point.ts observation.ts alarm.ts pool.ts
-        ├── stores/             # damStore.ts pointStore.ts alarmStore.ts
+        ├── types/              # dam.ts section.ts point.ts observation.ts alarm.ts pool.ts baseline.ts
+        ├── stores/             # damStore.ts pointStore.ts alarmStore.ts baselineStore.ts
         ├── components/common/  # AlarmTag.tsx FilterBar.tsx StatBadge.tsx EmptyPanel.tsx
+        ├── components/baseline/ # BaselineTag.tsx HandoverModal.tsx HandoverHistoryDrawer.tsx
         ├── hooks/              # useAlarmLevel.ts useIdbTable.ts
         ├── pages/              # DamList.tsx PointConfig.tsx ObservationEntry.tsx TrendBoard.tsx AlarmBoard.tsx PoolLog.tsx
         ├── router/index.tsx
@@ -79,10 +80,10 @@ sologsb101-1007/
 ## 五、数据存储说明
 
 - **IndexedDB 库名**：`gbtaildam`（Dexie 封装，`src/utils/db.ts`）
-- **对象表**：`dams`、`sections`、`points`、`observations`、`alarms`、`pools`
-- **数据结构版本**：`DB_VERSION = 2`，含 `version(1)` → `version(2)` 的索引变更与 `upgrade()` 迁移（补齐 `revision`、用所属断面回填测点 `damId`、用测点回填预警 `damId` 并补齐处置字段）
-- **首屏自动播种**：`initDatabase()` 中 `if (await db.dams.count() === 0) await seedDatabase()`，播种 2 座坝体 → 4 个断面 → 9 个测点 → 21 条观测 → 6 张预警 → 5 条库水位记录的完整父子孙链条；播种幂等
-- **localStorage 辅助键**：`gbtaildam:db-version`、`gbtaildam:last-backup-at`、`gbtaildam:ui-prefs`
+- **对象表**：`dams`、`sections`、`points`、`observations`、`alarms`、`pools`、`baselineHandovers`、`baselineReviews`
+- **数据结构版本**：`DB_VERSION = 3`，含 `version(1)` → `version(2)` → `version(3)` 的索引变更与 `upgrade()` 迁移（补齐 `revision`、用所属断面回填测点 `damId`、用测点回填预警 `damId` 并补齐处置字段；v3 为历史观测补 `baselineId=null`，不改写累计结果）
+- **首屏自动播种**：`initDatabase()` 中 `if (await db.dams.count() === 0) await seedDatabase()`，播种 2 座坝体 → 4 个断面 → 9 个测点 → 22 条观测 → 6 张预警 → 5 条库水位记录 → 1 次测斜管基准移交（pt-2 于 2024-06-10 换新管）→ 1 项级别变化待复核的完整父子孙链条；播种幂等
+- **localStorage 辅助键**：`gbtaildam:db-version`、`gbtaildam:last-backup-at`、`gbtaildam:ui-prefs`、`gbtaildam:handover-drafts`（基准移交写入失败待重试草稿）
 - 应用为**无状态容器**：数据不落容器磁盘、不使用数据库服务、不挂载命名卷
 
 ## 六、本地开发
@@ -100,3 +101,15 @@ npm run preview    # 本地预览构建产物
 - 累计变化量 `= 读数 − 初值`；日速率 `= |本次读数 − 上次读数| ÷ 间隔天数`
 - 比值 `= |累计变化量| ÷ 阈值`；分级：`≥0.70` 蓝、`≥0.85` 黄、`≥1.00` 橙、`≥1.30` 红
 - 干滩长度达标下限 `100 m`，安全超高达标下限 `1.5 m`
+
+## 八、测点基准移交（测斜管换新）
+
+测点换管后监测员若仍按旧初值计算会造成趋势、日速率口径与预警级别整体偏差，系统提供“基准移交”（测点配置 / 速率计算页的「基准移交」按钮）：
+
+- **登记内容**：换管日期、旧管末次读数（日期 + 读数）、新管初值、换管原因与说明、登记人；形成不可覆盖的移交履历（同测点多次移交必须按更晚换管日期，单事务内拒绝“后到覆盖先完成”）。
+- **展示口径**：换管当天（含）起累计变化按新管初值计算；换管前的原观测保留观测当时结果，仍挂在旧基准（趋势曲线、观测明细、导出 CSV 均标注「旧基准 / 新基准」）。
+- **跨日速率**：始终按相邻两次**原始读数**差值 ÷ 间隔天数计算，跨越换管边界不变形。
+- **历史保护**：已闭环预警及其处置记录不参与任何重算或改写。
+- **草稿重试**：移交提交前草稿先落 localStorage（`gbtaildam:handover-drafts`），写入失败或冲突时保留，可改期后重试，成功才清除。
+- **级别复核**：移交时对比旧管末次读数（旧基准）与新基准下最新读数的预警级别，级别发生变化即生成「待复核」项，在预警处置页填写复核人/意见后归档。
+- **导出**：速率计算页导出含新旧基准列的观测台账 CSV；预警处置页导出基准移交履历 CSV（含级别变化与复核结论）与预警闭环 CSV。

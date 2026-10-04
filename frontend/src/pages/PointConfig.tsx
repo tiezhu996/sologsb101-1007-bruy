@@ -3,14 +3,18 @@
  * 按断面批量建点、逐点设初值与阈值；阈值改动先进草稿，再逐条或批量提交。
  * 消费 Point、Section；复用 <FilterBar>、<EmptyPanel>、<StatBadge>。
  */
-import { useMemo, useState } from 'react'
-import { App as AntdApp, Button, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Table, Tag } from 'antd'
+import { useEffect, useMemo, useState } from 'react'
+import { App as AntdApp, Badge, Button, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Table, Tag, Tooltip } from 'antd'
 import type { TableColumnsType } from 'antd'
 import EmptyPanel from '@/components/common/EmptyPanel'
 import FilterBar, { type FilterModel } from '@/components/common/FilterBar'
 import StatBadge from '@/components/common/StatBadge'
+import BaselineTag from '@/components/baseline/BaselineTag'
+import HandoverModal from '@/components/baseline/HandoverModal'
+import HandoverHistoryDrawer from '@/components/baseline/HandoverHistoryDrawer'
 import { useDamStore } from '@/stores/damStore'
 import { usePointStore } from '@/stores/pointStore'
+import { useBaselineStore } from '@/stores/baselineStore'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { db, type ObservationRow } from '@/utils/db'
 import {
@@ -21,7 +25,7 @@ import {
   type PointDraft,
   type PointType
 } from '@/types/point'
-import { alarmLevelOf, isExceeded, ratioOf } from '@/utils/threshold'
+import { alarmLevelOf, effectiveCumulative, isExceeded, ratioOf } from '@/utils/threshold'
 
 interface BulkDraft {
   sectionId: string
@@ -37,6 +41,7 @@ export default function PointConfig() {
   const { message } = AntdApp.useApp()
   const damStore = useDamStore()
   const pointStore = usePointStore()
+  const baselineStore = useBaselineStore()
   const observationTable = useIdbTable<ObservationRow>(db.observations)
 
   const [pointForm] = Form.useForm<PointDraft>()
@@ -44,6 +49,13 @@ export default function PointConfig() {
   const [pointOpen, setPointOpen] = useState(false)
   const [bulkOpen, setBulkOpen] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
+  const [handoverPoint, setHandoverPoint] = useState<Point | null>(null)
+  const [historyPoint, setHistoryPoint] = useState<Point | null>(null)
+
+  // 挂载时载入写入失败待重试的移交草稿（localStorage）
+  useEffect(() => {
+    baselineStore.loadDrafts()
+  }, [baselineStore])
 
   const filter = pointStore.filter
   const filterSelects = useMemo(
@@ -69,23 +81,24 @@ export default function PointConfig() {
     })
   }
 
-  /** 各测点最新的累计变化量（用于越限统计） */
+  /** 各测点最新的累计变化量（换管后按当日基准展示，用于越限统计） */
   const latestCumulative = useMemo(() => {
     const map: Record<string, number> = {}
-    observationTable.rows.forEach((row) => {
-      const existing = map[row.pointId]
-      if (existing === undefined) {
-        map[row.pointId] = row.cumulative
+    pointStore.points.forEach((point) => {
+      const own = observationTable.rows
+        .filter((row) => row.pointId === point.id)
+        .sort((a, b) => b.date.localeCompare(a.date))
+      const latestRow = own[0]
+      if (latestRow) {
+        map[point.id] = effectiveCumulative(
+          point.initialValue,
+          baselineStore.handoversOfPoint(point.id),
+          latestRow
+        )
       }
     })
-    observationTable.rows.forEach((row) => {
-      const latest = observationTable.rows
-        .filter((item) => item.pointId === row.pointId)
-        .sort((a, b) => b.date.localeCompare(a.date))[0]
-      if (latest) map[row.pointId] = latest.cumulative
-    })
     return map
-  }, [observationTable.rows])
+  }, [observationTable.rows, pointStore.points, baselineStore])
 
   const exceededCount = pointStore.points.filter((point) =>
     isExceeded(latestCumulative[point.id] ?? 0, point.threshold)
@@ -216,22 +229,26 @@ export default function PointConfig() {
     { title: '类型', dataIndex: 'type', width: 100, render: (value: PointType) => <Tag color="blue">{value}</Tag> },
     {
       title: '初值 / 阈值',
-      width: 210,
+      width: 230,
       render: (_value, record) => {
         const draft = pointStore.thresholdDraft[record.id]
         const initial = draft ? draft.initialValue : record.initialValue
         const threshold = draft ? draft.threshold : record.threshold
+        const handed = baselineStore.handoversOfPoint(record.id).length > 0
         return (
           <Space size={4}>
-            <InputNumber
-              size="small"
-              style={{ width: 84 }}
-              value={initial}
-              step={0.1}
-              onChange={(value) =>
-                pointStore.setThresholdDraft(record.id, { initialValue: Number(value ?? 0), threshold })
-              }
-            />
+            <Tooltip title={handed ? '该测点已做基准移交，初值请通过「基准移交」演进；此处仅可调整阈值' : undefined}>
+              <InputNumber
+                size="small"
+                style={{ width: 84 }}
+                value={initial}
+                step={0.1}
+                disabled={handed}
+                onChange={(value) =>
+                  pointStore.setThresholdDraft(record.id, { initialValue: Number(value ?? 0), threshold })
+                }
+              />
+            </Tooltip>
             <span>/</span>
             <InputNumber
               size="small"
@@ -249,7 +266,9 @@ export default function PointConfig() {
               disabled={!draft}
               onClick={async () => {
                 await pointStore.commitThresholdDraft(record.id)
-                message.success(`${record.code} 初值与阈值已保存`)
+                message.success(
+                  handed ? `${record.code} 阈值已保存（初值由基准移交管理）` : `${record.code} 初值与阈值已保存`
+                )
               }}
             >
               保存
@@ -260,6 +279,24 @@ export default function PointConfig() {
     },
     { title: '单位', dataIndex: 'unit', width: 80 },
     { title: '安装日期', dataIndex: 'installDate', width: 120 },
+    {
+      title: '基准',
+      width: 110,
+      render: (_value, record) => {
+        const list = baselineStore.handoversOfPoint(record.id)
+        const last = list[list.length - 1] ?? null
+        return last ? (
+          <Space size={4} direction="vertical" style={{ lineHeight: 1.4 }}>
+            <BaselineTag handover={last} />
+            <span className="muted" style={{ fontSize: 12 }}>
+              自 {last.effectiveDate}
+            </span>
+          </Space>
+        ) : (
+          <BaselineTag old />
+        )
+      }
+    },
     {
       title: '最新累计变化',
       width: 150,
@@ -276,13 +313,24 @@ export default function PointConfig() {
     },
     {
       title: '操作',
-      width: 150,
+      width: 240,
       render: (_value, record) => (
-        <Space size={4}>
+        <Space size={4} wrap>
           <Button type="link" size="small" onClick={() => openEdit(record)}>
             编辑
           </Button>
-          <Popconfirm title="删除该测点将同时删除其观测记录与预警单" onConfirm={() => removePoint(record)}>
+          <Tooltip title={record.type === '测斜' ? '登记换管：换管日期、旧管末次读数、新管初值' : '登记基准重设移交'}>
+            <Button type="link" size="small" onClick={() => setHandoverPoint(record)}>
+              基准移交
+              {baselineStore.drafts[record.id] ? (
+                <Badge status="error" offset={[4, -2]} title="有写入失败待重试的草稿" />
+              ) : null}
+            </Button>
+          </Tooltip>
+          <Button type="link" size="small" onClick={() => setHistoryPoint(record)}>
+            履历
+          </Button>
+          <Popconfirm title="删除该测点将同时删除其观测记录、预警单与基准履历" onConfirm={() => removePoint(record)}>
             <Button type="link" size="small" danger>
               删除
             </Button>
@@ -322,6 +370,9 @@ export default function PointConfig() {
           percent={pointStore.points.length === 0 ? 0 : Math.round((exceededCount / pointStore.points.length) * 100)}
           tone="danger"
         />
+        <StatBadge label="基准移交" value={baselineStore.handovers.length} suffix="次" tone="info" />
+        <StatBadge label="待复核级别变化" value={baselineStore.pendingReviewCount()} suffix="项" tone="warning" />
+        <StatBadge label="待重试草稿" value={Object.keys(baselineStore.drafts).length} suffix="份" tone="danger" />
       </div>
 
       <FilterBar
@@ -349,7 +400,7 @@ export default function PointConfig() {
             compact
           />
         ) : (
-          <Table<Point> rowKey="id" size="small" bordered dataSource={rows} columns={columns} pagination={false} scroll={{ x: 1200 }} />
+          <Table<Point> rowKey="id" size="small" bordered dataSource={rows} columns={columns} pagination={false} scroll={{ x: 1480 }} />
         )}
       </div>
 
@@ -375,8 +426,19 @@ export default function PointConfig() {
               onChange={(value: PointType) => pointForm.setFieldsValue({ unit: POINT_UNIT[value] })}
             />
           </Form.Item>
-          <Form.Item name="initialValue" label="初值" rules={[{ required: true, message: '请填写初值' }]}>
-            <InputNumber step={0.1} style={{ width: '100%' }} />
+          <Form.Item
+            name="initialValue"
+            label="初值"
+            extra={editingId && baselineStore.handoversOfPoint(editingId).length > 0
+              ? '该测点已做基准移交，初值由移交履历管理，如需演进请使用「基准移交」'
+              : undefined}
+            rules={[{ required: true, message: '请填写初值' }]}
+          >
+            <InputNumber
+              step={0.1}
+              style={{ width: '100%' }}
+              disabled={Boolean(editingId && baselineStore.handoversOfPoint(editingId).length > 0)}
+            />
           </Form.Item>
           <Form.Item name="threshold" label="阈值（允许最大变化量）" rules={[{ required: true, message: '请填写阈值' }]}>
             <InputNumber min={0.1} step={0.5} style={{ width: '100%' }} />
@@ -423,6 +485,25 @@ export default function PointConfig() {
           </Form.Item>
         </Form>
       </Modal>
+
+      <HandoverModal
+        open={handoverPoint !== null}
+        point={handoverPoint}
+        observations={observationTable.rows}
+        onClose={() => setHandoverPoint(null)}
+      />
+
+      <HandoverHistoryDrawer
+        open={historyPoint !== null}
+        point={historyPoint}
+        onClose={() => setHistoryPoint(null)}
+        onNewHandover={() => {
+          if (historyPoint) {
+            setHandoverPoint(historyPoint)
+            setHistoryPoint(null)
+          }
+        }}
+      />
     </div>
   )
 }

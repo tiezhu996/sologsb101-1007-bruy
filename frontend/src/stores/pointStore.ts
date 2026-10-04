@@ -81,6 +81,13 @@ export const usePointStore = create<PointState>((set, get) => ({
       const section = await db.sections.get(patch.sectionId)
       if (section) next.damId = section.damId
     }
+    // 已有基准移交（换管）的测点，初值只能通过“基准移交”演进，禁止直接改写历史初值
+    if (patch.initialValue !== undefined) {
+      const handoverCount = await db.baselineHandovers.where('pointId').equals(id).count()
+      if (handoverCount > 0) {
+        delete next.initialValue
+      }
+    }
     await db.points.update(id, next)
   },
 
@@ -128,8 +135,10 @@ export const usePointStore = create<PointState>((set, get) => ({
   async commitThresholdDraft(pointId) {
     const draft = get().thresholdDraft[pointId]
     if (!draft) return
+    const handoverCount = await db.baselineHandovers.where('pointId').equals(pointId).count()
     await db.points.update(pointId, {
-      initialValue: draft.initialValue,
+      // 已换管测点的初值由移交记录管理，草稿只允许改阈值
+      ...(handoverCount === 0 ? { initialValue: draft.initialValue } : {}),
       threshold: draft.threshold > 0 ? draft.threshold : 1,
       updatedAt: Date.now()
     })
@@ -139,13 +148,14 @@ export const usePointStore = create<PointState>((set, get) => ({
   async commitAllThresholdDrafts() {
     const entries = Object.entries(get().thresholdDraft)
     if (entries.length === 0) return 0
+    const handed = new Set((await db.baselineHandovers.toArray()).map((item) => item.pointId))
     const rows = get()
       .points.filter((point) => entries.some(([id]) => id === point.id))
       .map((point) => {
         const draft = get().thresholdDraft[point.id]
         return {
           ...point,
-          initialValue: draft.initialValue,
+          ...(handed.has(point.id) ? {} : { initialValue: draft.initialValue }),
           threshold: draft.threshold > 0 ? draft.threshold : 1,
           updatedAt: Date.now()
         }

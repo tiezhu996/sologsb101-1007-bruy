@@ -22,14 +22,26 @@ import AlarmTag from '@/components/common/AlarmTag'
 import EmptyPanel from '@/components/common/EmptyPanel'
 import FilterBar, { type FilterModel } from '@/components/common/FilterBar'
 import StatBadge from '@/components/common/StatBadge'
+import BaselineTag from '@/components/baseline/BaselineTag'
+import HandoverModal from '@/components/baseline/HandoverModal'
+import HandoverHistoryDrawer from '@/components/baseline/HandoverHistoryDrawer'
 import { useDamStore } from '@/stores/damStore'
 import { usePointStore } from '@/stores/pointStore'
 import { useAlarmStore } from '@/stores/alarmStore'
+import { useBaselineStore } from '@/stores/baselineStore'
 import { useAlarmLevel } from '@/hooks/useAlarmLevel'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { db, type ObservationRow } from '@/utils/db'
+import { exportObservationCsv } from '@/utils/export'
 import { POINT_TYPES, type Point, type PointType } from '@/types/point'
-import { formatRate, formatReading, ratioOf } from '@/utils/threshold'
+import type { BaselineHandover } from '@/types/baseline'
+import {
+  effectiveCumulative,
+  formatRate,
+  formatReading,
+  ratioOf,
+  resolveObservationBaseline
+} from '@/utils/threshold'
 
 interface TrendRow {
   point: Point
@@ -40,6 +52,8 @@ interface TrendRow {
   cumulative: number
   dailyRate: number
   ratio: number
+  baselineHandover: BaselineHandover | null
+  handoverCount: number
 }
 
 export default function TrendBoard() {
@@ -47,6 +61,7 @@ export default function TrendBoard() {
   const damStore = useDamStore()
   const pointStore = usePointStore()
   const alarmStore = useAlarmStore()
+  const baselineStore = useBaselineStore()
   const alarmLevel = useAlarmLevel()
   const observationTable = useIdbTable<ObservationRow>(db.observations, { sortByUpdatedAt: false })
 
@@ -54,6 +69,8 @@ export default function TrendBoard() {
   const [onlyExceeded, setOnlyExceeded] = useState(false)
   const [thresholdOpen, setThresholdOpen] = useState(false)
   const [editingPoint, setEditingPoint] = useState<Point | null>(null)
+  const [handoverPoint, setHandoverPoint] = useState<Point | null>(null)
+  const [historyPoint, setHistoryPoint] = useState<Point | null>(null)
   const [thresholdForm] = Form.useForm<{ initialValue: number; threshold: number }>()
 
   const filter = pointStore.filter
@@ -94,9 +111,16 @@ export default function TrendBoard() {
           .filter((row) => row.pointId === point.id)
           .sort((a, b) => a.date.localeCompare(b.date))
         const latest = own[own.length - 1] ?? null
+        const handovers = baselineStore.handoversOfPoint(point.id)
         const section = damStore.sections.find((item) => item.id === point.sectionId)
         const dam = damStore.dams.find((item) => item.id === point.damId)
-        const cumulative = latest ? latest.cumulative : 0
+        // 换管当天起按新基准展示；旧观测保留当时结果（旧基准）
+        const cumulative = latest
+          ? effectiveCumulative(point.initialValue, handovers, latest)
+          : 0
+        const baseline = latest
+          ? resolveObservationBaseline(point.initialValue, handovers, latest)
+          : null
         return {
           point,
           damName: dam ? dam.name : '—',
@@ -105,12 +129,22 @@ export default function TrendBoard() {
           count: own.length,
           cumulative,
           dailyRate: latest ? latest.dailyRate : 0,
-          ratio: ratioOf(cumulative, point.threshold)
+          ratio: ratioOf(cumulative, point.threshold),
+          baselineHandover: baseline ? baseline.handover : null,
+          handoverCount: handovers.length
         }
       })
     const filtered = onlyExceeded ? rows.filter((row) => row.ratio >= 0.7) : rows
     return filtered.sort((a, b) => b.ratio - a.ratio)
-  }, [pointStore.points, observationTable.rows, damStore.sections, damStore.dams, filter, onlyExceeded])
+  }, [
+    pointStore.points,
+    observationTable.rows,
+    damStore.sections,
+    damStore.dams,
+    filter,
+    onlyExceeded,
+    baselineStore
+  ])
 
   const exceededCount = trendRows.filter((row) => row.ratio >= 0.7).length
   const averageRate = useMemo(() => {
@@ -128,20 +162,32 @@ export default function TrendBoard() {
     [observationTable.rows, drawerPointId]
   )
   const drawerLatest = drawerObservations[0] ?? null
-  const drawerLevel = drawerPoint && drawerLatest ? alarmLevel.evaluate(drawerPoint, drawerLatest.reading).level : null
+  const drawerResolution =
+    drawerPoint && drawerLatest
+      ? resolveObservationBaseline(drawerPoint.initialValue, baselineStore.handoversOfPoint(drawerPoint.id), drawerLatest)
+      : null
+  const drawerLevel =
+    drawerPoint && drawerLatest && drawerResolution
+      ? alarmLevel.evaluate(drawerPoint, drawerLatest.reading, drawerResolution.initialValue).level
+      : null
 
   const generateAlarm = async (point: Point, observation: ObservationRow): Promise<void> => {
     if (alarmStore.alarms.some((alarm) => alarm.pointId === point.id && alarm.triggerDate === observation.date)) {
       message.info('该测点当日已生成预警单')
       return
     }
-    const result = alarmLevel.buildDraft(point, observation.date, observation.reading)
+    const resolution = resolveObservationBaseline(
+      point.initialValue,
+      baselineStore.handoversOfPoint(point.id),
+      observation
+    )
+    const result = alarmLevel.buildDraft(point, observation.date, observation.reading, resolution.initialValue)
     if (!result) {
       message.info('该观测未越限，无需生成预警单')
       return
     }
     await alarmStore.createAlarm({ ...result.draft, measure: result.basis })
-    message.success(`已生成${result.draft.level}色预警单`)
+    message.success(`已生成${result.draft.level}色预警单（按${resolution.handover ? '新' : '原'}基准）`)
   }
 
   const openThreshold = (point: Point): void => {
@@ -154,11 +200,16 @@ export default function TrendBoard() {
     if (!editingPoint) return
     const values = await thresholdForm.validateFields().catch(() => null)
     if (!values) return
-    await pointStore.updatePoint(editingPoint.id, {
-      initialValue: values.initialValue,
-      threshold: values.threshold
-    })
-    message.success(`${editingPoint.code} 初值与阈值已更新，历史观测偏差已重算`)
+    const handed = baselineStore.handoversOfPoint(editingPoint.id).length > 0
+    await pointStore.updatePoint(
+      editingPoint.id,
+      handed ? { threshold: values.threshold } : { initialValue: values.initialValue, threshold: values.threshold }
+    )
+    message.success(
+      handed
+        ? `${editingPoint.code} 阈值已更新；该测点已换管，初值请通过「基准移交」演进`
+        : `${editingPoint.code} 初值与阈值已更新`
+    )
     setThresholdOpen(false)
   }
 
@@ -190,17 +241,27 @@ export default function TrendBoard() {
     },
     {
       title: '累计变化',
-      width: 140,
+      width: 180,
       render: (_value, record) => (
-        <span style={{ color: record.ratio >= 0.7 ? '#b03a2e' : undefined }}>
-          {record.cumulative.toFixed(3)} {record.point.unit}
-        </span>
+        <Space size={6}>
+          <span style={{ color: record.ratio >= 0.7 ? '#b03a2e' : undefined }}>
+            {record.cumulative.toFixed(3)} {record.point.unit}
+          </span>
+          <BaselineTag handover={record.baselineHandover} />
+        </Space>
       )
     },
     {
       title: '日速率',
       width: 130,
-      render: (_value, record) => (record.latest ? formatRate(record.dailyRate, record.point.unit) : '—')
+      render: (_value, record) =>
+        record.latest ? (
+          <span title="按相邻原始读数间隔天数计算，跨换管不变">
+            {formatRate(record.dailyRate, record.point.unit)}
+          </span>
+        ) : (
+          '—'
+        )
     },
     {
       title: '占阈值比',
@@ -212,17 +273,24 @@ export default function TrendBoard() {
       width: 150,
       render: (_value, record) => {
         if (!record.latest) return <Tag>暂无观测</Tag>
-        const level = alarmLevel.evaluate(record.point, record.latest.reading).level
-        return level ? <AlarmTag level={level} size="small" /> : <Tag color="green">正常</Tag>
+        const resolvedLevel = alarmLevel.evaluate(
+          record.point,
+          record.latest.reading,
+          record.baselineHandover ? record.baselineHandover.newInitialValue : undefined
+        ).level
+        return resolvedLevel ? <AlarmTag level={resolvedLevel} size="small" /> : <Tag color="green">正常</Tag>
       }
     },
     {
       title: '操作',
-      width: 170,
+      width: 220,
       render: (_value, record) => (
-        <Space size={4}>
+        <Space size={4} wrap>
           <Button type="link" size="small" onClick={() => setDrawerPointId(record.point.id)}>
             曲线
+          </Button>
+          <Button type="link" size="small" onClick={() => setHandoverPoint(record.point)}>
+            基准移交
           </Button>
           <Button
             type="link"
@@ -247,6 +315,13 @@ export default function TrendBoard() {
           </p>
         </div>
         <div className="page-head__actions">
+          <Button
+            onClick={() =>
+              exportObservationCsv(damStore.dams, damStore.sections, pointStore.points, observationTable.rows, baselineStore.handovers)
+            }
+          >
+            导出观测台账 CSV
+          </Button>
           <Button onClick={() => setOnlyExceeded((value) => !value)}>{onlyExceeded ? '查看全部测点' : '仅看越限测点'}</Button>
         </div>
       </div>
@@ -309,10 +384,17 @@ export default function TrendBoard() {
             <Descriptions size="small" bordered column={2}>
               <Descriptions.Item label="测点类型">{drawerPoint.type}</Descriptions.Item>
               <Descriptions.Item label="单位">{drawerPoint.unit}</Descriptions.Item>
-              <Descriptions.Item label="初值">{drawerPoint.initialValue}</Descriptions.Item>
+              <Descriptions.Item label="当前初值">{drawerPoint.initialValue}</Descriptions.Item>
               <Descriptions.Item label="阈值">{drawerPoint.threshold}</Descriptions.Item>
+              <Descriptions.Item label="基准">
+                {(() => {
+                  const list = baselineStore.handoversOfPoint(drawerPoint.id)
+                  const last = list[list.length - 1] ?? null
+                  return <BaselineTag handover={last} />
+                })()}
+              </Descriptions.Item>
               <Descriptions.Item label="观测次数">{drawerObservations.length}</Descriptions.Item>
-              <Descriptions.Item label="最新判定">
+              <Descriptions.Item label="最新判定" span={2}>
                 {drawerLevel ? <AlarmTag level={drawerLevel} size="small" /> : <Tag color="green">正常</Tag>}
               </Descriptions.Item>
             </Descriptions>
@@ -327,10 +409,16 @@ export default function TrendBoard() {
                   按最新观测生成预警单
                 </Button>
               ) : null}
-              <Button size="small" onClick={() => openThreshold(drawerPoint)}>
-                编辑初值与阈值
+              <Button size="small" onClick={() => setHandoverPoint(drawerPoint)}>
+                基准移交
               </Button>
-              <Popconfirm title="删除该测点将同时删除其观测记录与预警单" onConfirm={() => removePoint(drawerPoint)}>
+              <Button size="small" onClick={() => setHistoryPoint(drawerPoint)}>
+                基准履历
+              </Button>
+              <Button size="small" onClick={() => openThreshold(drawerPoint)}>
+                编辑阈值
+              </Button>
+              <Popconfirm title="删除该测点将同时删除其观测记录、预警单与基准履历" onConfirm={() => removePoint(drawerPoint)}>
                 <Button size="small" danger>
                   删除测点
                 </Button>
@@ -346,11 +434,26 @@ export default function TrendBoard() {
                 pagination={false}
                 dataSource={drawerObservations}
                 columns={[
-                  { title: '日期', dataIndex: 'date', width: 120 },
-                  { title: '读数', dataIndex: 'reading', width: 110, render: (value: number) => value.toFixed(3) },
-                  { title: '累计变化', dataIndex: 'cumulative', width: 120, render: (value: number) => value.toFixed(3) },
-                  { title: '日速率', dataIndex: 'dailyRate', width: 110, render: (value: number) => value.toFixed(4) },
-                  { title: '观测人', dataIndex: 'observer', width: 100 }
+                  { title: '日期', dataIndex: 'date', width: 110 },
+                  { title: '读数', dataIndex: 'reading', width: 100, render: (value: number) => value.toFixed(3) },
+                  {
+                    title: '基准',
+                    width: 100,
+                    render: (_value, record) => (
+                      <BaselineTag
+                        handover={
+                          resolveObservationBaseline(
+                            drawerPoint.initialValue,
+                            baselineStore.handoversOfPoint(drawerPoint.id),
+                            record
+                          ).handover
+                        }
+                      />
+                    )
+                  },
+                  { title: '累计变化', dataIndex: 'cumulative', width: 110, render: (value: number) => value.toFixed(3) },
+                  { title: '日速率', dataIndex: 'dailyRate', width: 100, render: (value: number) => value.toFixed(4) },
+                  { title: '观测人', dataIndex: 'observer', width: 90 }
                 ]}
               />
             )}
@@ -373,9 +476,18 @@ export default function TrendBoard() {
           <Form.Item
             name="initialValue"
             label={`初值（${editingPoint ? editingPoint.unit : ''}）`}
+            extra={
+              editingPoint && baselineStore.handoversOfPoint(editingPoint.id).length > 0
+                ? '该测点已做基准移交，初值已锁定为新管初值，请通过「基准移交」演进'
+                : undefined
+            }
             rules={[{ required: true, message: '请填写初值' }]}
           >
-            <InputNumber step={0.01} style={{ width: '100%' }} />
+            <InputNumber
+              step={0.01}
+              style={{ width: '100%' }}
+              disabled={Boolean(editingPoint && baselineStore.handoversOfPoint(editingPoint.id).length > 0)}
+            />
           </Form.Item>
           <Form.Item
             name="threshold"
@@ -386,6 +498,25 @@ export default function TrendBoard() {
           </Form.Item>
         </Form>
       </Modal>
+
+      <HandoverModal
+        open={handoverPoint !== null}
+        point={handoverPoint}
+        observations={observationTable.rows}
+        onClose={() => setHandoverPoint(null)}
+      />
+
+      <HandoverHistoryDrawer
+        open={historyPoint !== null}
+        point={historyPoint}
+        onClose={() => setHistoryPoint(null)}
+        onNewHandover={() => {
+          if (historyPoint) {
+            setHandoverPoint(historyPoint)
+            setHistoryPoint(null)
+          }
+        }}
+      />
     </div>
   )
 }
