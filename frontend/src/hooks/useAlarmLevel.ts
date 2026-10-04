@@ -32,17 +32,18 @@ export interface AlarmDraftResult {
 }
 
 export interface UseAlarmLevelResult {
-  evaluate: (point: Point, reading: number) => AlarmEvaluation
+  /** 按读数判定；baselineValue 缺省用测点当前初值，历史观测应传其所属基准初值 */
+  evaluate: (point: Point, reading: number, baselineValue?: number) => AlarmEvaluation
   /** 越限时返回预警草稿与依据，未越限返回 null */
-  buildDraft: (point: Point, date: string, reading: number) => AlarmDraftResult | null
+  buildDraft: (point: Point, date: string, reading: number, baselineValue?: number) => AlarmDraftResult | null
   colorOf: (level: AlarmLevel) => string
   bgOf: (level: AlarmLevel) => string
   levelOptions: AlarmLevel[]
 }
 
 export function useAlarmLevel(): UseAlarmLevelResult {
-  const evaluate = useCallback((point: Point, reading: number): AlarmEvaluation => {
-    const cumulative = cumulativeOf(reading, point.initialValue)
+  const evaluate = useCallback((point: Point, reading: number, baselineValue?: number): AlarmEvaluation => {
+    const cumulative = cumulativeOf(reading, baselineValue ?? point.initialValue)
     const ratio = ratioOf(cumulative, point.threshold)
     const level = alarmLevelOf(cumulative, point.threshold)
     return {
@@ -55,8 +56,8 @@ export function useAlarmLevel(): UseAlarmLevelResult {
   }, [])
 
   const buildDraft = useCallback(
-    (point: Point, date: string, reading: number): AlarmDraftResult | null => {
-      const evaluation = evaluate(point, reading)
+    (point: Point, date: string, reading: number, baselineValue?: number): AlarmDraftResult | null => {
+      const evaluation = evaluate(point, reading, baselineValue)
       if (evaluation.level === null) return null
       return {
         draft: {

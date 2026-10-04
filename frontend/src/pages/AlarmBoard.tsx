@@ -1,7 +1,8 @@
 /**
  * /alarms 预警触发与处置闭环
  * 按级别与状态处置预警，填写措施与处置人，状态机 待处置 → 处置中 → 已闭环。
- * 消费 Alarm、Point、Observation；复用 <AlarmTag>、<FilterBar>、<StatBadge>、<EmptyPanel>。
+ * 基准移交导致未闭环预警级别变化时生成待复核项；已闭环预警的处置记录保持不动。
+ * 消费 Alarm、Point、Observation、BaselineReview；复用 <AlarmTag>、<FilterBar>、<StatBadge>、<EmptyPanel>。
  */
 import { useMemo, useState } from 'react'
 import { App as AntdApp, Button, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Table, Tag } from 'antd'
@@ -13,6 +14,7 @@ import StatBadge from '@/components/common/StatBadge'
 import { useDamStore } from '@/stores/damStore'
 import { usePointStore } from '@/stores/pointStore'
 import { useAlarmStore } from '@/stores/alarmStore'
+import { useBaselineStore } from '@/stores/baselineStore'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { db, type ObservationRow } from '@/utils/db'
 import {
@@ -25,12 +27,14 @@ import {
   type AlarmLevel,
   type AlarmState
 } from '@/types/alarm'
+import type { BaselineReview } from '@/types/baseline'
 
 export default function AlarmBoard() {
   const { message } = AntdApp.useApp()
   const damStore = useDamStore()
   const pointStore = usePointStore()
   const alarmStore = useAlarmStore()
+  const baselineStore = useBaselineStore()
   const observationTable = useIdbTable<ObservationRow>(db.observations, { sortByUpdatedAt: false })
 
   const [form] = Form.useForm<AlarmDraft>()
@@ -83,6 +87,71 @@ export default function AlarmBoard() {
 
   const counts = alarmStore.counts()
   const levelCounts = alarmStore.levelCounts()
+
+  /** 基准移交引发的级别复核项：待复核在前，其余按登记时间倒序 */
+  const reviewRows = useMemo(
+    () =>
+      [...baselineStore.reviews].sort((a, b) => {
+        if (a.state !== b.state) return a.state === '待复核' ? -1 : 1
+        return b.createdAt - a.createdAt
+      }),
+    [baselineStore.reviews]
+  )
+  const pendingReviewCount = reviewRows.filter((review) => review.state === '待复核').length
+
+  const resolveReview = async (review: BaselineReview): Promise<void> => {
+    await baselineStore.resolveReview(review.id)
+    message.success('复核项已确认归档')
+  }
+
+  const reviewColumns: TableColumnsType<BaselineReview> = [
+    {
+      title: '坝体 / 测点',
+      width: 190,
+      render: (_value, record) => {
+        const point = pointStore.points.find((item) => item.id === record.pointId)
+        const dam = damStore.dams.find((item) => item.id === record.damId)
+        return `${dam ? dam.name : '—'} / ${point ? point.code : '测点已删除'}`
+      }
+    },
+    {
+      title: '换管日期',
+      width: 110,
+      render: (_value, record) =>
+        baselineStore.handovers.find((item) => item.id === record.handoverId)?.handoverDate ?? '—'
+    },
+    {
+      title: '级别变化',
+      width: 170,
+      render: (_value, record) => (
+        <Space size={4}>
+          <AlarmTag level={record.oldLevel} size="small" />
+          <span>→</span>
+          {record.newLevel ? <AlarmTag level={record.newLevel} size="small" /> : <Tag color="green">正常</Tag>}
+        </Space>
+      )
+    },
+    { title: '复核说明', dataIndex: 'note', width: 320 },
+    {
+      title: '状态',
+      width: 90,
+      render: (_value, record) => (
+        <Tag color={record.state === '待复核' ? 'orange' : 'green'}>{record.state}</Tag>
+      )
+    },
+    {
+      title: '操作',
+      width: 110,
+      render: (_value, record) =>
+        record.state === '待复核' ? (
+          <Button type="link" size="small" onClick={() => resolveReview(record)}>
+            确认复核
+          </Button>
+        ) : (
+          <span className="muted">已归档</span>
+        )
+    }
+  ]
 
   const openCreate = (): void => {
     if (pointStore.points.length === 0) {
@@ -245,8 +314,29 @@ export default function AlarmBoard() {
         <StatBadge label="预警总数" value={alarmStore.alarms.length} suffix="张" tone="primary" />
         <StatBadge label="待处置" value={counts['待处置']} suffix="张" tone="warning" />
         <StatBadge label="处置中" value={counts['处置中']} suffix="张" tone="info" />
+        <StatBadge label="待复核" value={pendingReviewCount} suffix="项" tone="warning" />
         <StatBadge label="闭环率" value={alarmStore.closedPercent()} percent={alarmStore.closedPercent()} tone="danger" hint={`红 ${levelCounts['红']} / 橙 ${levelCounts['橙']} / 黄 ${levelCounts['黄']} / 蓝 ${levelCounts['蓝']}`} />
       </div>
+
+      {reviewRows.length > 0 ? (
+        <div className="panel" style={{ marginTop: 16 }}>
+          <div className="panel-head">
+            <h3 className="panel-title" style={{ margin: 0 }}>
+              基准移交级别复核（待复核 {pendingReviewCount} 项）
+            </h3>
+            <span className="muted">换管移交后级别发生变化的未闭环预警；已闭环预警的处置记录不受影响</span>
+          </div>
+          <Table<BaselineReview>
+            rowKey="id"
+            size="small"
+            bordered
+            dataSource={reviewRows}
+            columns={reviewColumns}
+            pagination={false}
+            scroll={{ x: 1100 }}
+          />
+        </div>
+      ) : null}
 
       <FilterBar model={model} selects={filterSelects} keywordPlaceholder="搜索测点编号 / 处置人 / 措施" onModelChange={onModelChange} />
 

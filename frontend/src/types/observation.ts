@@ -6,10 +6,12 @@ export interface Observation {
   date: string
   /** 读数 */
   reading: number
-  /** 累计变化（读数 − 初值） */
+  /** 累计变化（读数 − 所属基准初值），结算后保留当时结果 */
   cumulative: number
   /** 日速率（与上一次观测的差值 ÷ 间隔天数） */
   dailyRate: number
+  /** 所属基准：null/缺省 = 原始基准，否则为基准移交记录 id */
+  baselineId?: string | null
   observer: string
   createdAt: number
   updatedAt: number

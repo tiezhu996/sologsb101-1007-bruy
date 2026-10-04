@@ -1,7 +1,8 @@
 /**
  * /observations 位移 / 浸润线观测录入
  * 按日期与测点类型成组录入读数，录入即与阈值比对并给出预警级别，可直接生成预警单。
- * 消费 Observation、Point；复用 <FilterBar>、<AlarmTag>、<EmptyPanel>、<StatBadge>。
+ * 读数按观测日期所属基准（原始基准 / 移交后新基准）结算累计变化，历史观测保留当时结果。
+ * 消费 Observation、Point、BaselineHandover；复用 <FilterBar>、<AlarmTag>、<EmptyPanel>、<StatBadge>。
  */
 import { useMemo, useState } from 'react'
 import { App as AntdApp, Button, Form, Input, InputNumber, Modal, Popconfirm, Space, Table, Tag } from 'antd'
@@ -13,17 +14,21 @@ import StatBadge from '@/components/common/StatBadge'
 import { useDamStore } from '@/stores/damStore'
 import { usePointStore } from '@/stores/pointStore'
 import { useAlarmStore } from '@/stores/alarmStore'
+import { useBaselineStore } from '@/stores/baselineStore'
 import { useAlarmLevel } from '@/hooks/useAlarmLevel'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { db, putObservation, type ObservationRow } from '@/utils/db'
 import { POINT_TYPES, type Point, type PointType } from '@/types/point'
 import type { ObservationDraft } from '@/types/observation'
+import { alarmLevelOf } from '@/utils/threshold'
+import { baselineForDate, baselineLabel } from '@/utils/baseline'
 
 export default function ObservationEntry() {
   const { message } = AntdApp.useApp()
   const damStore = useDamStore()
   const pointStore = usePointStore()
   const alarmStore = useAlarmStore()
+  const baselineStore = useBaselineStore()
   const alarmLevel = useAlarmLevel()
   const observationTable = useIdbTable<ObservationRow>(db.observations, { sortByUpdatedAt: false })
 
@@ -76,9 +81,21 @@ export default function ObservationEntry() {
 
   const draftReading = Form.useWatch('reading', form)
   const draftDate = Form.useWatch('date', form)
+  const handoversOfActive = useMemo(
+    () => (activePointId ? baselineStore.handoversOf(activePointId) : []),
+    [baselineStore, activePointId]
+  )
+  /** 录入草稿日期所适用的基准：换管当天起按新基准 */
+  const draftBaseline = useMemo(
+    () =>
+      activePoint
+        ? baselineForDate(activePoint.initialValue, handoversOfActive, draftDate || new Date().toISOString().slice(0, 10))
+        : null,
+    [activePoint, handoversOfActive, draftDate]
+  )
   const preview =
     activePoint && typeof draftReading === 'number'
-      ? alarmLevel.evaluate(activePoint, draftReading)
+      ? alarmLevel.evaluate(activePoint, draftReading, draftBaseline?.initialValue)
       : null
 
   const openCreate = (): void => {
@@ -154,7 +171,12 @@ export default function ObservationEntry() {
       message.info('当前读数未越限，无需生成预警单')
       return
     }
-    const result = alarmLevel.buildDraft(activePoint, draftDate || new Date().toISOString().slice(0, 10), Number(draftReading))
+    const result = alarmLevel.buildDraft(
+      activePoint,
+      draftDate || new Date().toISOString().slice(0, 10),
+      Number(draftReading),
+      draftBaseline?.initialValue
+    )
     if (!result) return
     await alarmStore.createAlarm({ ...result.draft, measure: result.basis })
     message.success(`已生成${result.draft.level}色预警单`)
@@ -171,12 +193,27 @@ export default function ObservationEntry() {
     },
     { title: '日速率', dataIndex: 'dailyRate', width: 120, render: (value: number) => value.toFixed(4) },
     {
+      title: '基准',
+      width: 130,
+      render: (_value, record) => {
+        const point = pointStore.points.find((item) => item.id === record.pointId)
+        if (!point) return '—'
+        const baseline = baselineForDate(point.initialValue, baselineStore.handoversOf(point.id), record.date)
+        return (
+          <Tag color={baseline.seq === 0 ? 'default' : 'purple'} title={`基准初值 ${baseline.initialValue} ${point.unit}`}>
+            {baselineLabel(baseline)}
+          </Tag>
+        )
+      }
+    },
+    {
       title: '判定',
       width: 150,
       render: (_value, record) => {
         const point = pointStore.points.find((item) => item.id === record.pointId)
         if (!point) return <span className="muted">测点已删除</span>
-        const level = alarmLevel.evaluate(point, record.reading).level
+        // 按落库时的累计变化判定：历史观测保留当时结果，不受后续基准移交影响
+        const level = alarmLevelOf(record.cumulative, point.threshold)
         return level ? <AlarmTag level={level} size="small" /> : <Tag color="green">正常</Tag>
       }
     },
@@ -240,7 +277,7 @@ export default function ObservationEntry() {
               const latest = observationTable.rows
                 .filter((row) => row.pointId === point.id)
                 .sort((a, b) => b.date.localeCompare(a.date))[0]
-              const level = latest ? alarmLevel.evaluate(point, latest.reading).level : null
+              const level = latest ? alarmLevelOf(latest.cumulative, point.threshold) : null
               return (
                 <div
                   key={point.id}
@@ -273,8 +310,9 @@ export default function ObservationEntry() {
                   {activePoint.code} · 观测明细
                   <span className="muted">
                     {' '}
-                    {activePoint.type} · 初值 {activePoint.initialValue} {activePoint.unit} · 阈值 {activePoint.threshold}{' '}
-                    {activePoint.unit}
+                    {activePoint.type} · 当前基准 {activePoint.initialValue} {activePoint.unit}
+                    {handoversOfActive.length > 0 ? `（已移交 ${handoversOfActive.length} 次）` : ''} · 阈值{' '}
+                    {activePoint.threshold} {activePoint.unit}
                   </span>
                 </h3>
                 <Button size="small" type="primary" onClick={openCreate}>
@@ -342,10 +380,15 @@ export default function ObservationEntry() {
             <Input placeholder="如 刘振国" />
           </Form.Item>
           {preview ? (
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
               <span className="muted">
                 累计变化 {preview.cumulative.toFixed(3)} · 占阈值 {(preview.ratio * 100).toFixed(1)}%
               </span>
+              {draftBaseline ? (
+                <Tag color={draftBaseline.seq === 0 ? 'default' : 'purple'}>
+                  {baselineLabel(draftBaseline)} · 初值 {draftBaseline.initialValue} {activePoint?.unit}
+                </Tag>
+              ) : null}
               {preview.level ? <AlarmTag level={preview.level} /> : <Tag color="green">正常</Tag>}
             </div>
           ) : null}

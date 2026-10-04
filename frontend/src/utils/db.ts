@@ -10,10 +10,12 @@ import type { Point } from '@/types/point'
 import type { Observation } from '@/types/observation'
 import type { Alarm } from '@/types/alarm'
 import type { Pool } from '@/types/pool'
-import { cumulativeOf, dailyRateOf, daysBetween } from '@/utils/threshold'
+import type { BaselineHandover, BaselineReview, HandoverDraft, HandoverExpected } from '@/types/baseline'
+import { alarmLevelOf, cumulativeOf, dailyRateOf, daysBetween } from '@/utils/threshold'
+import { baselineForDate, sortHandovers } from '@/utils/baseline'
 
 export const DB_NAME = 'gbtaildam'
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 export const LS_KEYS = {
   dbVersion: 'gbtaildam:db-version',
@@ -38,6 +40,8 @@ export interface BackupPayload {
   observations: Observation[]
   alarms: Alarm[]
   pools: Pool[]
+  handovers: BaselineHandover[]
+  reviews: BaselineReview[]
 }
 
 export interface Revisioned {
@@ -52,6 +56,8 @@ export type PointRow = Point & Revisioned
 export type ObservationRow = Observation & Revisioned
 export type AlarmRow = Alarm & Revisioned
 export type PoolRow = Pool & Revisioned
+export type HandoverRow = BaselineHandover & Revisioned
+export type ReviewRow = BaselineReview & Revisioned
 
 class TailDamDatabase extends Dexie {
   dams!: Table<DamRow, string>
@@ -60,6 +66,8 @@ class TailDamDatabase extends Dexie {
   observations!: Table<ObservationRow, string>
   alarms!: Table<AlarmRow, string>
   pools!: Table<PoolRow, string>
+  handovers!: Table<HandoverRow, string>
+  reviews!: Table<ReviewRow, string>
 
   constructor() {
     super(DB_NAME)
@@ -74,7 +82,7 @@ class TailDamDatabase extends Dexie {
     })
 
     // v2：测点/预警补 damId 冗余列（按坝体筛选免联表）；全部表补 revision 行修订号
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         dams: 'id, name, damType, grade, updatedAt',
         sections: 'id, damId, stakeNo, updatedAt',
@@ -121,6 +129,28 @@ class TailDamDatabase extends Dexie {
             }
             if (typeof alarm.handler !== 'string') alarm.handler = ''
             if (typeof alarm.measure !== 'string') alarm.measure = ''
+          })
+      })
+
+    // v3：新增基准移交（handovers）与级别复核（reviews）两表；观测行补 baselineId 所属基准
+    this.version(DB_VERSION)
+      .stores({
+        dams: 'id, name, damType, grade, updatedAt',
+        sections: 'id, damId, stakeNo, updatedAt',
+        points: 'id, sectionId, damId, code, type, updatedAt',
+        observations: 'id, pointId, date, observer, updatedAt',
+        alarms: 'id, pointId, damId, level, state, updatedAt',
+        pools: 'id, damId, date, updatedAt',
+        handovers: 'id, pointId, damId, handoverDate, updatedAt',
+        reviews: 'id, pointId, damId, alarmId, state, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        // 存量观测一律挂在原始基准下，保留当时结算结果
+        await tx
+          .table('observations')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            if (row.baselineId === undefined) row.baselineId = null
           })
       })
   }
@@ -220,6 +250,7 @@ function buildSeedObservations(): ObservationRow[] {
       reading,
       cumulative: cumulativeOf(reading, initialValue),
       dailyRate,
+      baselineId: null,
       observer,
       createdAt: stamp(-200 + index),
       updatedAt: stamp(-200 + index),
@@ -229,7 +260,7 @@ function buildSeedObservations(): ObservationRow[] {
 }
 
 export async function seedDatabase(): Promise<void> {
-  await db.transaction('rw', [db.dams, db.sections, db.points, db.observations, db.alarms, db.pools], async () => {
+  await db.transaction('rw', [db.dams, db.sections, db.points, db.observations, db.alarms, db.pools, db.handovers, db.reviews], async () => {
     await db.dams.bulkPut(SEED_DAMS)
     await db.sections.bulkPut(SEED_SECTIONS)
     await db.points.bulkPut(SEED_POINTS)
@@ -250,7 +281,7 @@ export async function initDatabase(): Promise<void> {
 /* ============================== 级联删除 ============================== */
 
 export async function deleteDamCascade(damId: string): Promise<void> {
-  await db.transaction('rw', [db.dams, db.sections, db.points, db.observations, db.alarms, db.pools], async () => {
+  await db.transaction('rw', [db.dams, db.sections, db.points, db.observations, db.alarms, db.pools, db.handovers, db.reviews], async () => {
     const sections = await db.sections.where('damId').equals(damId).toArray()
     await deletePointsOfSections(sections.map((section) => section.id))
     if (sections.length > 0) await db.sections.bulkDelete(sections.map((section) => section.id))
@@ -260,16 +291,18 @@ export async function deleteDamCascade(damId: string): Promise<void> {
 }
 
 export async function deleteSectionCascade(sectionId: string): Promise<void> {
-  await db.transaction('rw', db.sections, db.points, db.observations, db.alarms, async () => {
+  await db.transaction('rw', [db.sections, db.points, db.observations, db.alarms, db.handovers, db.reviews], async () => {
     await deletePointsOfSections([sectionId])
     await db.sections.delete(sectionId)
   })
 }
 
 export async function deletePointCascade(pointId: string): Promise<void> {
-  await db.transaction('rw', db.points, db.observations, db.alarms, async () => {
+  await db.transaction('rw', [db.points, db.observations, db.alarms, db.handovers, db.reviews], async () => {
     await db.observations.where('pointId').equals(pointId).delete()
     await db.alarms.where('pointId').equals(pointId).delete()
+    await db.handovers.where('pointId').equals(pointId).delete()
+    await db.reviews.where('pointId').equals(pointId).delete()
     await db.points.delete(pointId)
   })
 }
@@ -281,6 +314,8 @@ async function deletePointsOfSections(sectionIds: string[]): Promise<void> {
   if (pointIds.length > 0) {
     await db.observations.where('pointId').anyOf(pointIds).delete()
     await db.alarms.where('pointId').anyOf(pointIds).delete()
+    await db.handovers.where('pointId').anyOf(pointIds).delete()
+    await db.reviews.where('pointId').anyOf(pointIds).delete()
     await db.points.bulkDelete(pointIds)
   }
 }
@@ -288,25 +323,29 @@ async function deletePointsOfSections(sectionIds: string[]): Promise<void> {
 /* ============================ 整库导入导出 ============================ */
 
 export async function countAll(): Promise<Record<string, number>> {
-  const [dams, sections, points, observations, alarms, pools] = await Promise.all([
+  const [dams, sections, points, observations, alarms, pools, handovers, reviews] = await Promise.all([
     db.dams.count(),
     db.sections.count(),
     db.points.count(),
     db.observations.count(),
     db.alarms.count(),
-    db.pools.count()
+    db.pools.count(),
+    db.handovers.count(),
+    db.reviews.count()
   ])
-  return { dams, sections, points, observations, alarms, pools }
+  return { dams, sections, points, observations, alarms, pools, handovers, reviews }
 }
 
 export async function exportSnapshot(): Promise<BackupPayload> {
-  const [dams, sections, points, observations, alarms, pools] = await Promise.all([
+  const [dams, sections, points, observations, alarms, pools, handovers, reviews] = await Promise.all([
     db.dams.toArray(),
     db.sections.toArray(),
     db.points.toArray(),
     db.observations.toArray(),
     db.alarms.toArray(),
-    db.pools.toArray()
+    db.pools.toArray(),
+    db.handovers.toArray(),
+    db.reviews.toArray()
   ])
   const strip = <T extends Revisioned>(row: T): Omit<T, 'revision'> => {
     const { revision: _revision, ...rest } = row
@@ -321,39 +360,48 @@ export async function exportSnapshot(): Promise<BackupPayload> {
     points: points.map(strip),
     observations: observations.map(strip),
     alarms: alarms.map(strip),
-    pools: pools.map(strip)
+    pools: pools.map(strip),
+    handovers: handovers.map(strip),
+    reviews: reviews.map(strip)
   }
 }
 
 export async function importSnapshot(payload: BackupPayload): Promise<void> {
-  await db.transaction('rw', [db.dams, db.sections, db.points, db.observations, db.alarms, db.pools], async () => {
+  await db.transaction('rw', [db.dams, db.sections, db.points, db.observations, db.alarms, db.pools, db.handovers, db.reviews], async () => {
     await Promise.all([
       db.dams.clear(),
       db.sections.clear(),
       db.points.clear(),
       db.observations.clear(),
       db.alarms.clear(),
-      db.pools.clear()
+      db.pools.clear(),
+      db.handovers.clear(),
+      db.reviews.clear()
     ])
     const rev = <T>(row: T): T & Revisioned => ({ ...row, revision: ROW_REVISION })
     await db.dams.bulkPut((payload.dams ?? []).map(rev))
     await db.sections.bulkPut((payload.sections ?? []).map(rev))
     await db.points.bulkPut((payload.points ?? []).map(rev))
-    await db.observations.bulkPut((payload.observations ?? []).map(rev))
+    // 旧存档可能缺 baselineId，导入时统一挂到原始基准
+    await db.observations.bulkPut((payload.observations ?? []).map((row) => rev({ baselineId: null, ...row })))
     await db.alarms.bulkPut((payload.alarms ?? []).map(rev))
     await db.pools.bulkPut((payload.pools ?? []).map(rev))
+    await db.handovers.bulkPut((payload.handovers ?? []).map(rev))
+    await db.reviews.bulkPut((payload.reviews ?? []).map(rev))
   })
 }
 
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', [db.dams, db.sections, db.points, db.observations, db.alarms, db.pools], async () => {
+  await db.transaction('rw', [db.dams, db.sections, db.points, db.observations, db.alarms, db.pools, db.handovers, db.reviews], async () => {
     await Promise.all([
       db.dams.clear(),
       db.sections.clear(),
       db.points.clear(),
       db.observations.clear(),
       db.alarms.clear(),
-      db.pools.clear()
+      db.pools.clear(),
+      db.handovers.clear(),
+      db.reviews.clear()
     ])
   })
 }
@@ -363,45 +411,173 @@ export async function resetDatabase(): Promise<void> {
   await seedDatabase()
 }
 
-/** 观测录入：写入累计变化量与日速率 */
+/** 观测录入：按观测日期所属基准写入累计变化量，日速率仍按相邻读数间隔天算 */
 export async function putObservation(
   row: Omit<Observation, 'cumulative' | 'dailyRate'> & { cumulative?: number; dailyRate?: number }
 ): Promise<ObservationRow> {
   const point = await db.points.get(row.pointId)
-  const initialValue = point ? point.initialValue : 0
+  const handovers = await db.handovers.where('pointId').equals(row.pointId).toArray()
+  const baseline = baselineForDate(point ? point.initialValue : 0, handovers, row.date)
   const others = (await db.observations.where('pointId').equals(row.pointId).toArray())
     .filter((item) => item.id !== row.id)
     .sort((a, b) => a.date.localeCompare(b.date))
   const previous = others.filter((item) => item.date < row.date).pop() ?? null
-  const cumulative = cumulativeOf(row.reading, initialValue)
+  const cumulative = cumulativeOf(row.reading, baseline.initialValue)
   const dailyRate = previous ? dailyRateOf(row.reading, previous.reading, daysBetween(previous.date, row.date)) : 0
   const next: ObservationRow = {
     ...row,
     cumulative,
     dailyRate,
+    baselineId: baseline.handoverId,
     revision: ROW_REVISION
   }
   await db.observations.put(next)
   return next
 }
 
-/** 重算某测点全部观测的累计变化量与日速率 */
+/** 重算某测点全部观测：每条按观测日期所属基准结算，历史基准的结果不被新基准覆盖 */
 export async function recalculateObservations(pointId: string): Promise<void> {
   const point = await db.points.get(pointId)
-  const initialValue = point ? point.initialValue : 0
+  const currentInitial = point ? point.initialValue : 0
+  const handovers = await db.handovers.where('pointId').equals(pointId).toArray()
   const rows = (await db.observations.where('pointId').equals(pointId).toArray()).sort((a, b) =>
     a.date.localeCompare(b.date)
   )
   const patches = rows.map((row, index) => {
     const previous = index === 0 ? null : rows[index - 1]
+    const baseline = baselineForDate(currentInitial, handovers, row.date)
     return {
       ...row,
-      cumulative: cumulativeOf(row.reading, initialValue),
+      cumulative: cumulativeOf(row.reading, baseline.initialValue),
       dailyRate: previous ? dailyRateOf(row.reading, previous.reading, daysBetween(previous.date, row.date)) : 0,
+      baselineId: baseline.handoverId,
       updatedAt: Date.now()
     }
   })
   if (patches.length > 0) await db.observations.bulkPut(patches)
+}
+
+/* ============================== 基准移交 ============================== */
+
+/** 并发冲突：打开移交表单后已有其他移交先完成，本次提交不得覆盖 */
+export class HandoverConflictError extends Error {
+  constructor(message = '已有新的基准移交先完成，本次提交未写入') {
+    super(message)
+    this.name = 'HandoverConflictError'
+  }
+}
+
+export interface HandoverCommitResult {
+  handover: HandoverRow
+  /** 按新基准重算的观测条数（换管当天及之后） */
+  recomputed: number
+  /** 级别变化生成的待复核项 */
+  reviews: ReviewRow[]
+}
+
+/**
+ * 登记基准移交（测斜管换新等）：
+ * - 事务内校验并发令牌，后到的提交不得覆盖先完成的移交
+ * - 换管当天起观测按新基准重算累计变化，之前的观测保留当时结果并挂在旧基准
+ * - 未闭环预警若级别变化则生成待复核项；已闭环预警的处置记录保持不动
+ */
+export async function commitHandover(
+  pointId: string,
+  draft: HandoverDraft,
+  expected: HandoverExpected
+): Promise<HandoverCommitResult> {
+  return db.transaction('rw', [db.points, db.observations, db.alarms, db.handovers, db.reviews], async () => {
+    const point = await db.points.get(pointId)
+    if (!point) throw new Error('测点不存在，可能已被删除')
+
+    const existing = sortHandovers(await db.handovers.where('pointId').equals(pointId).toArray())
+    if (point.updatedAt !== expected.pointUpdatedAt || existing.length !== expected.handoverCount) {
+      throw new HandoverConflictError()
+    }
+    const lastHandoverDate = existing.length > 0 ? existing[existing.length - 1].handoverDate : null
+    if (lastHandoverDate && draft.handoverDate < lastHandoverDate) {
+      throw new Error(`换管日期不能早于已有移交日期（${lastHandoverDate}）`)
+    }
+
+    const now = Date.now()
+    const observations = (await db.observations.where('pointId').equals(pointId).toArray()).sort((a, b) =>
+      a.date.localeCompare(b.date)
+    )
+    const beforeHandover = observations.filter((item) => item.date < draft.handoverDate)
+    const lastOld = beforeHandover.length > 0 ? beforeHandover[beforeHandover.length - 1] : null
+
+    const handover: HandoverRow = {
+      id: createId('bh'),
+      pointId,
+      damId: point.damId,
+      handoverDate: draft.handoverDate,
+      oldInitialValue: point.initialValue,
+      oldLastReading: Number(draft.oldLastReading) || 0,
+      oldLastDate: lastOld ? lastOld.date : '',
+      newInitialValue: Number(draft.newInitialValue) || 0,
+      reason: draft.reason.trim(),
+      createdAt: now,
+      updatedAt: now,
+      revision: ROW_REVISION
+    }
+    await db.handovers.put(handover)
+    await db.points.update(pointId, { initialValue: handover.newInitialValue, updatedAt: now })
+
+    // 换管当天（含）起按新基准重算；之前的观测保留当时结果，仍挂旧基准
+    let recomputed = 0
+    for (const row of observations) {
+      if (row.date < handover.handoverDate) continue
+      const index = observations.findIndex((item) => item.id === row.id)
+      const previous = index > 0 ? observations[index - 1] : null
+      await db.observations.update(row.id, {
+        cumulative: cumulativeOf(row.reading, handover.newInitialValue),
+        dailyRate: previous ? dailyRateOf(row.reading, previous.reading, daysBetween(previous.date, row.date)) : 0,
+        baselineId: handover.id,
+        updatedAt: now
+      })
+      recomputed += 1
+    }
+
+    // 级别复核：以移交后最新累计变化重新判定未闭环预警；已闭环预警不动
+    const reviews: ReviewRow[] = []
+    const refreshed = (await db.observations.where('pointId').equals(pointId).toArray()).sort((a, b) =>
+      a.date.localeCompare(b.date)
+    )
+    const latest = refreshed.length > 0 ? refreshed[refreshed.length - 1] : null
+    if (latest) {
+      const newLevel = alarmLevelOf(latest.cumulative, point.threshold)
+      const openAlarms = (await db.alarms.where('pointId').equals(pointId).toArray()).filter(
+        (alarm) => alarm.state !== '已闭环'
+      )
+      const pendingAlarmIds = new Set(
+        (await db.reviews.where('pointId').equals(pointId).toArray())
+          .filter((review) => review.state === '待复核')
+          .map((review) => review.alarmId)
+      )
+      for (const alarm of openAlarms) {
+        if (alarm.level === newLevel) continue
+        if (pendingAlarmIds.has(alarm.id)) continue
+        const review: ReviewRow = {
+          id: createId('rv'),
+          pointId,
+          damId: point.damId,
+          alarmId: alarm.id,
+          handoverId: handover.id,
+          oldLevel: alarm.level,
+          newLevel,
+          state: '待复核',
+          note: `基准移交（${handover.handoverDate}）后最新累计变化 ${latest.cumulative.toFixed(3)}，按阈值判定为${newLevel ? `${newLevel}色` : '正常（未越限）'}，与原${alarm.level}色预警不一致`,
+          createdAt: now,
+          updatedAt: now,
+          revision: ROW_REVISION
+        }
+        await db.reviews.put(review)
+        reviews.push(review)
+      }
+    }
+
+    return { handover, recomputed, reviews }
+  })
 }
 
 /* ============================ 本地 UI 偏好 ============================ */

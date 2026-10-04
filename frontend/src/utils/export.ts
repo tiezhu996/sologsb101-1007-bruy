@@ -7,8 +7,10 @@ import type { Point } from '@/types/point'
 import type { Observation } from '@/types/observation'
 import type { Alarm } from '@/types/alarm'
 import type { Pool } from '@/types/pool'
+import type { BaselineHandover } from '@/types/baseline'
 import { checkPool, MIN_BEACH_LENGTH_M, MIN_FREEBOARD_M } from '@/types/pool'
 import { ratioOf } from '@/utils/threshold'
+import { baselineForDate, baselineLabel, sortHandovers } from '@/utils/baseline'
 
 export function download(filename: string, content: string, mime: string): void {
   const blob = new Blob([content], { type: mime })
@@ -39,12 +41,13 @@ export function csvCell(value: string | number): string {
   return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text
 }
 
-/** 观测台账 CSV */
+/** 观测台账 CSV（含每条观测所属基准，新旧基准可追溯） */
 export function exportObservationCsv(
   dams: Dam[],
   sections: Section[],
   points: Point[],
-  observations: Observation[]
+  observations: Observation[],
+  handovers: BaselineHandover[] = []
 ): string {
   const header = [
     '坝体',
@@ -61,6 +64,8 @@ export function exportObservationCsv(
     '累计变化',
     '日速率',
     '占阈值比(%)',
+    '观测基准',
+    '基准初值',
     '观测人'
   ]
   const lines: string[] = [header.map(csvCell).join(',')]
@@ -68,6 +73,9 @@ export function exportObservationCsv(
     const point = points.find((item) => item.id === observation.pointId)
     const section = point ? sections.find((item) => item.id === point.sectionId) : undefined
     const dam = section ? dams.find((item) => item.id === section.damId) : undefined
+    const baseline = point
+      ? baselineForDate(point.initialValue, handovers.filter((item) => item.pointId === point.id), observation.date)
+      : null
     lines.push(
       [
         dam ? dam.name : '—',
@@ -84,6 +92,8 @@ export function exportObservationCsv(
         observation.cumulative,
         observation.dailyRate,
         point ? (ratioOf(observation.cumulative, point.threshold) * 100).toFixed(1) : '—',
+        baseline ? baselineLabel(baseline) : '—',
+        baseline ? baseline.initialValue : '—',
         observation.observer
       ]
         .map(csvCell)
@@ -92,6 +102,46 @@ export function exportObservationCsv(
   })
   const filename = `监测观测台账-${stampSuffix()}.csv`
   download(filename, `\uFEFF${lines.join('\n')}`, 'text/csv;charset=utf-8')
+  return filename
+}
+
+/** 基准移交台账 CSV（换管日期、旧管末次读数、新管初值与原因） */
+export function exportHandoverCsv(dams: Dam[], points: Point[], handovers: BaselineHandover[]): string {
+  const header = [
+    '坝体',
+    '测点编号',
+    '测点类型',
+    '换管日期',
+    '旧基准初值',
+    '旧管末次读数',
+    '旧管末次观测日期',
+    '新管初值',
+    '换管原因',
+    '登记时间'
+  ]
+  const lines: string[] = [header.map(csvCell).join(',')]
+  sortHandovers(handovers).forEach((handover) => {
+    const point = points.find((item) => item.id === handover.pointId)
+    const dam = dams.find((item) => item.id === handover.damId)
+    lines.push(
+      [
+        dam ? dam.name : '—',
+        point ? point.code : '—',
+        point ? point.type : '—',
+        handover.handoverDate,
+        handover.oldInitialValue,
+        handover.oldLastReading,
+        handover.oldLastDate || '—',
+        handover.newInitialValue,
+        handover.reason || '—',
+        new Date(handover.createdAt).toLocaleString('zh-CN', { hour12: false })
+      ]
+        .map(csvCell)
+        .join(',')
+    )
+  })
+  const filename = `基准移交台账-${stampSuffix()}.csv`
+  download(filename, `﻿${lines.join('\n')}`, 'text/csv;charset=utf-8')
   return filename
 }
 

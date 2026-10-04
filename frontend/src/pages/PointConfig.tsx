@@ -1,16 +1,19 @@
 /**
  * /points 测点布设与阈值配置
  * 按断面批量建点、逐点设初值与阈值；阈值改动先进草稿，再逐条或批量提交。
- * 消费 Point、Section；复用 <FilterBar>、<EmptyPanel>、<StatBadge>。
+ * 测斜管换新等基准变更走「基准移交」登记，新旧基准沿革可在抽屉中查看并导出台账。
+ * 消费 Point、Section、BaselineHandover；复用 <FilterBar>、<EmptyPanel>、<StatBadge>、<HandoverModal>。
  */
 import { useMemo, useState } from 'react'
-import { App as AntdApp, Button, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Table, Tag } from 'antd'
+import { App as AntdApp, Button, Drawer, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Table, Tag } from 'antd'
 import type { TableColumnsType } from 'antd'
 import EmptyPanel from '@/components/common/EmptyPanel'
 import FilterBar, { type FilterModel } from '@/components/common/FilterBar'
+import HandoverModal from '@/components/common/HandoverModal'
 import StatBadge from '@/components/common/StatBadge'
 import { useDamStore } from '@/stores/damStore'
 import { usePointStore } from '@/stores/pointStore'
+import { useBaselineStore } from '@/stores/baselineStore'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { db, type ObservationRow } from '@/utils/db'
 import {
@@ -21,7 +24,10 @@ import {
   type PointDraft,
   type PointType
 } from '@/types/point'
+import type { BaselineHandover } from '@/types/baseline'
 import { alarmLevelOf, isExceeded, ratioOf } from '@/utils/threshold'
+import { baselineLabel, listBaselines, sortHandovers } from '@/utils/baseline'
+import { exportHandoverCsv } from '@/utils/export'
 
 interface BulkDraft {
   sectionId: string
@@ -37,6 +43,7 @@ export default function PointConfig() {
   const { message } = AntdApp.useApp()
   const damStore = useDamStore()
   const pointStore = usePointStore()
+  const baselineStore = useBaselineStore()
   const observationTable = useIdbTable<ObservationRow>(db.observations)
 
   const [pointForm] = Form.useForm<PointDraft>()
@@ -44,6 +51,13 @@ export default function PointConfig() {
   const [pointOpen, setPointOpen] = useState(false)
   const [bulkOpen, setBulkOpen] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
+  const [handoverPointId, setHandoverPointId] = useState<string | null>(null)
+  const [handoverOpen, setHandoverOpen] = useState(false)
+  const [baselinePointId, setBaselinePointId] = useState<string | null>(null)
+
+  /** 移交/沿革弹窗一律从 store 取最新测点，避免移交完成后仍展示旧基准 */
+  const handoverPoint = handoverPointId ? pointStore.points.find((point) => point.id === handoverPointId) ?? null : null
+  const baselinePoint = baselinePointId ? pointStore.points.find((point) => point.id === baselinePointId) ?? null : null
 
   const filter = pointStore.filter
   const filterSelects = useMemo(
@@ -90,6 +104,29 @@ export default function PointConfig() {
   const exceededCount = pointStore.points.filter((point) =>
     isExceeded(latestCumulative[point.id] ?? 0, point.threshold)
   ).length
+
+  /** 测点 id → 已登记移交次数 */
+  const handoverCountOf = useMemo(() => {
+    const map: Record<string, number> = {}
+    baselineStore.handovers.forEach((handover) => {
+      map[handover.pointId] = (map[handover.pointId] ?? 0) + 1
+    })
+    return map
+  }, [baselineStore.handovers])
+
+  /** 基准沿革抽屉：当前查看测点的移交记录（新的在前） */
+  const baselineHandovers = useMemo(
+    () =>
+      baselinePoint
+        ? sortHandovers(baselineStore.handoversOf(baselinePoint.id)).reverse()
+        : [],
+    [baselinePoint, baselineStore]
+  )
+  const baselineList = useMemo(
+    () => (baselinePoint ? listBaselines(baselinePoint.initialValue, baselineStore.handoversOf(baselinePoint.id)) : []),
+    [baselinePoint, baselineStore]
+  )
+  const currentBaseline = baselineList.length > 0 ? baselineList[baselineList.length - 1] : null
 
   const rows = pointStore.points.filter((point) => {
     if (filter.damId && point.damId !== filter.damId) return false
@@ -203,7 +240,17 @@ export default function PointConfig() {
   }
 
   const columns: TableColumnsType<Point> = [
-    { title: '测点编号', dataIndex: 'code', width: 120, render: (value: string) => <strong>{value}</strong> },
+    {
+      title: '测点编号',
+      dataIndex: 'code',
+      width: 160,
+      render: (value: string, record) => (
+        <Space size={4}>
+          <strong>{value}</strong>
+          {(handoverCountOf[record.id] ?? 0) > 0 ? <Tag color="purple">移交 {handoverCountOf[record.id]}</Tag> : null}
+        </Space>
+      )
+    },
     {
       title: '坝体 / 断面',
       width: 200,
@@ -276,11 +323,20 @@ export default function PointConfig() {
     },
     {
       title: '操作',
-      width: 150,
+      width: 210,
       render: (_value, record) => (
         <Space size={4}>
           <Button type="link" size="small" onClick={() => openEdit(record)}>
             编辑
+          </Button>
+          <Button
+            type="link"
+            size="small"
+            onClick={() => {
+              setBaselinePointId(record.id)
+            }}
+          >
+            基准
           </Button>
           <Popconfirm title="删除该测点将同时删除其观测记录与预警单" onConfirm={() => removePoint(record)}>
             <Button type="link" size="small" danger>
@@ -303,6 +359,15 @@ export default function PointConfig() {
         </div>
         <div className="page-head__actions">
           <Button onClick={openBulk}>批量布点</Button>
+          <Button
+            disabled={baselineStore.handovers.length === 0}
+            onClick={() => {
+              exportHandoverCsv(damStore.dams, pointStore.points, baselineStore.handovers)
+              message.success('基准移交台账已导出')
+            }}
+          >
+            导出移交台账
+          </Button>
           <Button disabled={Object.keys(pointStore.thresholdDraft).length === 0} onClick={commitAll}>
             提交阈值草稿（{Object.keys(pointStore.thresholdDraft).length}）
           </Button>
@@ -316,6 +381,7 @@ export default function PointConfig() {
         <StatBadge label="测点总数" value={pointStore.points.length} suffix="个" tone="primary" />
         <StatBadge label="断面数" value={damStore.sections.length} suffix="个" tone="info" />
         <StatBadge label="越限测点" value={exceededCount} suffix="个" tone="warning" />
+        <StatBadge label="基准移交" value={baselineStore.handovers.length} suffix="次" tone="default" />
         <StatBadge
           label="越限占比"
           value={exceededCount}
@@ -423,6 +489,81 @@ export default function PointConfig() {
           </Form.Item>
         </Form>
       </Modal>
+
+      <Drawer
+        open={baselinePoint !== null}
+        width={640}
+        title={baselinePoint ? `${baselinePoint.code} · 基准沿革` : '基准沿革'}
+        onClose={() => setBaselinePointId(null)}
+      >
+        {baselinePoint ? (
+          <>
+            <div className="panel" style={{ marginBottom: 14 }}>
+              <div className="panel-head">
+                <h3 className="panel-title" style={{ margin: 0 }}>
+                  当前基准
+                </h3>
+                <Button
+                  size="small"
+                  type="primary"
+                  onClick={() => {
+                    setHandoverPointId(baselinePoint.id)
+                    setHandoverOpen(true)
+                  }}
+                >
+                  登记基准移交
+                </Button>
+              </div>
+              {currentBaseline ? (
+                <Space size={8} wrap>
+                  <Tag color={currentBaseline.seq === 0 ? 'default' : 'purple'}>{baselineLabel(currentBaseline)}</Tag>
+                  <span>
+                    初值 {currentBaseline.initialValue} {baselinePoint.unit}
+                  </span>
+                  {currentBaseline.sinceDate ? <span className="muted">自 {currentBaseline.sinceDate} 起生效</span> : null}
+                </Space>
+              ) : null}
+              <p className="muted" style={{ margin: '8px 0 0' }}>
+                测斜管换新等基准变更须登记移交：换管当天起观测按新基准结算，之前的观测保留当时结果并挂在旧基准。
+              </p>
+            </div>
+            {baselineHandovers.length === 0 ? (
+              <EmptyPanel title="暂无移交记录" description="该测点一直使用原始基准，尚未登记过基准移交。" compact />
+            ) : (
+              <Table<BaselineHandover>
+                rowKey="id"
+                size="small"
+                bordered
+                pagination={false}
+                dataSource={baselineHandovers}
+                columns={[
+                  { title: '换管日期', dataIndex: 'handoverDate', width: 110 },
+                  {
+                    title: '旧基准 → 新基准',
+                    width: 170,
+                    render: (_value, record) => `${record.oldInitialValue} → ${record.newInitialValue} ${baselinePoint.unit}`
+                  },
+                  {
+                    title: '旧管末次读数',
+                    width: 150,
+                    render: (_value, record) =>
+                      record.oldLastDate ? `${record.oldLastReading}（${record.oldLastDate}）` : `${record.oldLastReading}`
+                  },
+                  { title: '原因', dataIndex: 'reason', width: 180, render: (value: string) => value || '—' }
+                ]}
+              />
+            )}
+          </>
+        ) : (
+          <EmptyPanel title="未选择测点" description="在测点清单中点击「基准」查看该测点的基准沿革。" compact />
+        )}
+      </Drawer>
+
+      <HandoverModal
+        point={handoverPoint}
+        open={handoverOpen}
+        onClose={() => setHandoverOpen(false)}
+      />
     </div>
   )
 }
